@@ -78,6 +78,27 @@ function enableOrganization(): { org: string } {
     return { org: config.organization.organizationSlug || '' };
 }
 
+// DRF MultipleChoiceField filters (e.g. quality reports "status") read repeated
+// query keys: "?status=current&status=superseded". Axios 1.x serializes arrays
+// with bracketed keys ("status[]=...") by default, which such filters ignore.
+const repeatableParamsSerializer: NonNullable<Parameters<typeof Axios.get>[1]>['paramsSerializer'] = {
+    serialize: (params: Record<string, unknown>): string => {
+        const searchParams = new URLSearchParams();
+        Object.entries(params).forEach(([key, value]) => {
+            if (value === undefined || value === null) {
+                return;
+            }
+
+            if (Array.isArray(value)) {
+                value.forEach((item) => searchParams.append(key, String(item)));
+            } else {
+                searchParams.append(key, String(value));
+            }
+        });
+        return searchParams.toString();
+    },
+};
+
 function configureStorage(storage: Storage, useDefaultLocation = false): Partial<Params> {
     return {
         ...(!useDefaultLocation ? {
@@ -89,7 +110,11 @@ function configureStorage(storage: Storage, useDefaultLocation = false): Partial
     };
 }
 
-function fetchAll<T extends { id: number | string }>(url, filter = {}): Promise<{ count: number; results: T[] }> {
+function fetchAll<T extends { id: number | string }>(
+    url,
+    filter = {},
+    requestConfig: Parameters<typeof Axios.get>[1] = {},
+): Promise<{ count: number; results: T[] }> {
     const pageSize = 500;
     const result = {
         count: 0,
@@ -114,6 +139,7 @@ function fetchAll<T extends { id: number | string }>(url, filter = {}): Promise<
                     page_size: pageSize,
                     page,
                 },
+                ...requestConfig,
             }).then((response) => {
                 const { hasMore } = appendToResult(response.data);
                 if (hasMore) {
@@ -2715,6 +2741,7 @@ async function getQualityReports(
                         ...filter,
                         ...enableOrganization(),
                     },
+                    { paramsSerializer: repeatableParamsSerializer },
                 ),
             };
         } else {
@@ -2722,6 +2749,7 @@ async function getQualityReports(
                 params: {
                     ...filter,
                 },
+                paramsSerializer: repeatableParamsSerializer,
             });
         }
     } catch (errorData) {

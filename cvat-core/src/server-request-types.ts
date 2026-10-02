@@ -5,7 +5,9 @@
 import {
     SerializedApiToken, SerializedUser, SerializedUserGrowthData,
 } from './server-response-types';
-import { QualityRequirementAnnotationType } from './quality/server-response-types';
+import {
+    QualityRequirementAnnotationType, SerializedQualityReportStatus,
+} from './quality/server-response-types';
 import { JobType } from './enums';
 import { Camelized, CamelizedV2 } from './type-utils';
 
@@ -77,6 +79,10 @@ export interface APIQualityReportsFilter extends APICommonFilterParams {
     task_id?: number;
     job_id?: number;
     target?: string;
+    // A MultipleChoiceField on the backend: may be a single value
+    // or several repeated "status=" query parameters.
+    status?: SerializedQualityReportStatus | SerializedQualityReportStatus[];
+    include_legacy?: boolean;
 }
 export type QualityReportsFilter = Camelized<APIQualityReportsFilter>;
 

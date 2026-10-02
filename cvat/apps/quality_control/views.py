@@ -128,10 +128,40 @@ class QualityConflictsViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
 
                 queryset = AnnotationConflictPermission.add_org_filter_proof(queryset)
             else:
+                # Browsing conflicts by task/project scope returns only the
+                # current report families; superseded/legacy conflicts stay
+                # readable through their owning report id.
+                queryset = self._scope_conflicts_to_current_families(queryset)
                 perm = AnnotationConflictPermission.create_scope_list(self.request)
                 queryset = perm.filter(queryset)
 
         return queryset
+
+    def _scope_conflicts_to_current_families(self, queryset):
+        current = models.QualityReportStatus.CURRENT
+        task_id = self.request.query_params.get("task_id")
+        project_id = self.request.query_params.get("project_id")
+        job_id = self.request.query_params.get("job_id")
+
+        if task_id is not None:
+            queryset = queryset.filter(
+                models.Q(report__job__segment__task_id=task_id, report__status=current)
+                | models.Q(report__parents__task_id=task_id, report__parents__status=current)
+            )
+        elif project_id is not None:
+            queryset = queryset.filter(
+                report__parents__project_id=project_id,
+                report__parents__status=current,
+            )
+        elif job_id is not None:
+            queryset = queryset.filter(
+                report__job_id=job_id,
+                report__status=current,
+            )
+        else:
+            queryset = queryset.filter(report__status=current)
+
+        return queryset.distinct()
 
 
 REPORT_TARGET_PARAM_NAME = "target"
@@ -188,6 +218,17 @@ REPORT_TARGET_PARAM_NAME = "target"
                 required=False,
                 default=False,
                 description="Include reports stored in the legacy data format",
+            ),
+            OpenApiParameter(
+                "status",
+                type=OpenApiTypes.STR,
+                enum=["current", "superseded", "legacy"],
+                required=False,
+                description=(
+                    "Filter reports by publication status. May be repeated to "
+                    "select several statuses. 'legacy' selects reports created "
+                    "before rules generations were introduced."
+                ),
             ),
         ],
         responses={
@@ -323,6 +364,17 @@ class QualityReportViewSet(
                 # The new UI only understands generalized reports. Legacy reports remain
                 # downloadable, and API clients can discover them with include_legacy=true.
                 queryset = queryset.filter(data__regex=CURRENT_REPORT_DATA_REGEX)
+
+            status_values = query_serializer.validated_data.get("status")
+            if status_values:
+                status_filter = models.Q()
+                for status_value in status_values:
+                    if status_value == "legacy":
+                        status_filter |= models.Q(status__isnull=True)
+                    else:
+                        status_filter |= models.Q(status=status_value)
+                queryset = queryset.filter(status_filter)
+
             queryset = queryset.defer("data")  # heavy field, should be excluded from COUNT(*)
 
         if self.action != "list":
@@ -901,5 +953,7 @@ class QualityRequirementViewSet(
 
         settings = instance.settings
         result = super().perform_destroy(instance)
-        settings.save()
+        from cvat.apps.quality_control.generation import bump_rules_version
+
+        bump_rules_version(settings)
         return result

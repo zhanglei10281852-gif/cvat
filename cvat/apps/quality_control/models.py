@@ -81,6 +81,15 @@ class QualityReportTarget(str, Enum):
         return tuple((x.value, x.name) for x in cls)
 
 
+class QualityReportStatus(models.TextChoices):
+    # Null represents legacy reports created before rules generations
+    CURRENT = "current", "Current"
+    SUPERSEDED = "superseded", "Superseded"
+
+    def __str__(self) -> str:
+        return self.value
+
+
 class QualityMetric(str, Enum):
     ACCURACY = "accuracy"
     PRECISION = "precision"
@@ -176,6 +185,24 @@ class QualityReport(models.Model):
     parents = models.ManyToManyField("self", symmetrical=False, blank=True, related_name="children")
     children: models.manager.ManyToManyRelatedManager[QualityReport]
 
+    # Effective rules generation bound to the report request. All reports of a
+    # family (the task/project root and its job/task children) share the same value.
+    generation = models.ForeignKey(
+        "quality_control.QualityRulesGeneration",
+        on_delete=models.PROTECT,
+        related_name="reports",
+        null=True,
+        blank=True,
+    )
+    # Current publication status; null for legacy reports predating generations.
+    status = models.CharField(
+        max_length=16,
+        choices=QualityReportStatus.choices,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
     created_date = models.DateTimeField(auto_now_add=True)
     target_last_updated = models.DateTimeField()
     gt_last_updated = models.DateTimeField(null=True)
@@ -202,7 +229,23 @@ class QualityReport(models.Model):
                     | models.Q(job_id__isnull=True, task_id__isnull=False, project_id__isnull=True)
                     | models.Q(job_id__isnull=True, task_id__isnull=True, project_id__isnull=False)
                 ),
-            )
+            ),
+            # At most one current family root per task / job / project target
+            models.UniqueConstraint(
+                fields=["task"],
+                condition=models.Q(status="current"),
+                name="quality_report_current_task_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["job"],
+                condition=models.Q(status="current"),
+                name="quality_report_current_job_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["project"],
+                condition=models.Q(status="current"),
+                name="quality_report_current_project_unique",
+            ),
         ]
 
     @cached_property
@@ -226,6 +269,15 @@ class QualityReport(models.Model):
             return QualityReportTarget.PROJECT
         else:
             assert False
+
+    def _parse_report(self):
+        from cvat.apps.quality_control.comparison_report import ComparisonReport
+
+        return ComparisonReport.from_json(self.data)
+
+    @property
+    def parameters(self):
+        return self._parse_report().parameters
 
     def _parse_report_summary(self):
         from cvat.apps.quality_control.comparison_report import ComparisonReport
@@ -388,6 +440,11 @@ class QualitySettings(TimestampedModel):
 
     max_validations_per_job = models.PositiveIntegerField(default=0)
 
+    # Monotonic version of the effective rules owned by this settings instance.
+    # It is bumped whenever the settings scalars or their requirement tree change,
+    # and whenever the task settings inheritance source changes.
+    rules_version = models.PositiveBigIntegerField(default=1)
+
     requirements: Sequence[QualityRequirement]
 
     @property
@@ -407,6 +464,62 @@ class QualitySettings(TimestampedModel):
 
     def to_dict(self):
         return model_to_dict(self)
+
+
+class QualityRulesGeneration(models.Model):
+    """
+    An immutable snapshot identity of the complete effective rules bound to a report request.
+
+    scope_settings is the settings instance owning the report target (task or project settings).
+    When the task settings inherit from project settings, source_settings points to the project
+    settings and inherit is True. The fingerprint identifies the actual effective rule content,
+    so generations of an inheriting task and its project share the same fingerprint.
+    """
+
+    scope_settings = models.ForeignKey(
+        QualitySettings,
+        on_delete=models.PROTECT,
+        related_name="rules_generations",
+    )
+    own_rules_version = models.PositiveBigIntegerField()
+    inherit = models.BooleanField(default=False)
+    source_settings = models.ForeignKey(
+        QualitySettings,
+        on_delete=models.PROTECT,
+        related_name="source_rules_generations",
+    )
+    source_rules_version = models.PositiveBigIntegerField()
+
+    # sha256 of the canonicalized effective settings and requirement tree
+    fingerprint = models.CharField(max_length=64, db_index=True)
+
+    created_date = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "scope_settings",
+                    "own_rules_version",
+                    "inherit",
+                    "source_settings",
+                    "source_rules_version",
+                ],
+                name="quality_rules_generation_unique_descriptor",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"QualityRulesGeneration(id={self.id}, "
+            f"scope_settings_id={self.scope_settings_id}, "
+            f"source_settings_id={self.source_settings_id}, "
+            f"fingerprint={self.fingerprint[:8]})"
+        )
+
+    @property
+    def organization_id(self) -> int | None:
+        return self.scope_settings.organization_id
 
 
 class QualityRequirementAnnotationType(models.TextChoices):
@@ -567,5 +680,10 @@ def ensure_base_quality_requirements(quality_settings: QualitySettings) -> bool:
     # A simple insert should just fail on a constraint in such cases, which is what we need.
     db_utils.bulk_create(QualityRequirement, requirements_to_create)
     db_utils.clear_prefetched_relation_cache(quality_settings, "requirements")
-    quality_settings.touch()
+
+    # Base requirements are the initial effective rule content: seeding them
+    # for newly created settings establishes rules version 1 and must not bump
+    # it. Callers that restore missing bases on already existing settings are
+    # responsible for advancing the version themselves, since that genuinely
+    # changes the effective rule content.
     return True

@@ -4,15 +4,13 @@
 
 from __future__ import annotations
 
-import itertools
 from collections import Counter
 from contextlib import suppress
 from copy import deepcopy
-
-from django.db import transaction
-from django.db.models import OuterRef, Subquery, prefetch_related_objects
+from datetime import datetime
 
 from cvat.apps.engine.filters import JsonLogicFilter
+from cvat.apps.engine.log import ServerLogManager
 from cvat.apps.engine.media_io.frame_provider import TaskFrameProvider
 from cvat.apps.engine.models import (
     Image,
@@ -38,6 +36,7 @@ from cvat.apps.quality_control.comparison_report import (
     deduplicate_annotation_conflicts,
 )
 from cvat.apps.quality_control.data_providers import JobDataProvider, QualitySettingsManager
+from cvat.apps.quality_control.generation import get_current_rules_generation
 from cvat.apps.quality_control.quality_handlers import (
     DatasetQualityEstimator,
     EffectiveQualityRequirement,
@@ -47,6 +46,16 @@ from cvat.apps.quality_control.quality_handlers import (
     merge_frame_summaries,
     resolve_effective_requirements,
     select_requirement_calculation,
+)
+from cvat.apps.quality_control.report_families import (
+    MAX_STALE_RECOMPUTES,
+    ProjectReportSnapshot,
+    StaleGenerationError,
+    TaskReportSnapshot,
+    get_current_project_report,
+    get_current_task_report,
+    publish_project_report_family,
+    publish_task_report_family,
 )
 from cvat.utils import django_database as db_utils
 
@@ -75,10 +84,70 @@ class TaskQualityCalculator:
         "task_name": "segment__task__name",
     }
 
-    def compute_report(self, task: Task | int) -> models.QualityReport | None:
+    def compute_report(
+        self,
+        task: Task | int,
+        *,
+        generation_id: int | None = None,
+    ) -> models.QualityReport | None:
+        if isinstance(task, int):
+            task = Task.objects.get(id=task)
+
+        # Bound rules generation; a stale snapshot is recomputed under the
+        # current generation and, if the rules keep changing, is discarded.
+        bound_generation_id = generation_id
+        for _attempt in range(MAX_STALE_RECOMPUTES + 1):
+            snapshot_outputs = self._compute_task_report_snapshot(
+                task, generation_id=bound_generation_id
+            )
+            if snapshot_outputs is None:
+                # The GT job was removed while the request was queued
+                return None
+
+            try:
+                return publish_task_report_family(**snapshot_outputs)
+            except StaleGenerationError as stale_error:
+                ServerLogManager("quality").glob.warning(
+                    "Stale quality report snapshot for task id %s, recomputing "
+                    "(attempt %s/%s): %s %s",
+                    task.id,
+                    _attempt + 1,
+                    MAX_STALE_RECOMPUTES + 1,
+                    stale_error.reason,
+                    stale_error.details,
+                )
+                # Rebind to the latest generation on the following snapshot
+                bound_generation_id = None
+                continue
+
+        ServerLogManager("quality").glob.warning(
+            "Discarding stale quality report computation for task id %s: "
+            "the rules/data generation kept changing; returning the current report",
+            task.id,
+        )
+        return get_current_task_report(task.id)
+
+    def _compute_task_report_snapshot(
+        self,
+        task: Task,
+        *,
+        generation_id: int | None,
+    ) -> dict | None:
+        # Resolve the bound generation before opening the READ ONLY
+        # repeatable-read transaction: after a stale recompute the current
+        # generation row may not exist yet and resolving it lazily would have
+        # to INSERT, which a read-only transaction rejects on PostgreSQL.
+        # Re-read the task so a project move between retries cannot make the
+        # generation resolve against a stale inheritance source.
+        resolution_task = Task.objects.only("id", "project_id").get(id=task.id)
+        bound_generation = (
+            models.QualityRulesGeneration.objects.get(id=generation_id)
+            if generation_id is not None
+            else get_current_rules_generation(task=resolution_task)
+        )
+
         with db_utils.transaction_with_repeatable_read():
-            if isinstance(task, int):
-                task = Task.objects.select_related("data").get(id=task)
+            task = Task.objects.select_related("data", "project").get(id=task.id)
 
             # The GT job could have been removed during scheduling, so we need to check it.
             gt_job_id = (
@@ -117,11 +186,6 @@ class TaskQualityCalculator:
                 )
             else:
                 filtered_job_ids = set(all_job_ids)
-
-            # TODO: Probably, can be optimized to this:
-            # - task updated (the gt job, frame set or labels changed) -> everything is computed
-            # - job updated -> job report is computed
-            #   old reports can be reused in this case
 
             # Try to use a shared queryset to minimize DB requests
             job_queryset = Job.objects.select_related("segment").filter(segment__task=task)
@@ -169,6 +233,18 @@ class TaskQualityCalculator:
                 # Release resources
                 del job_data_provider.dm_dataset
 
+            snapshot = TaskReportSnapshot(
+                generation_id=bound_generation.id,
+                target_last_updated=task.updated_date,
+                gt_last_updated=gt_job.updated_date,
+                job_ids=frozenset(j.id for j in jobs),
+                job_updated_dates={job.id: job.updated_date for job in jobs},
+                assignee_ids={job.id: job.assignee_id for job in jobs},
+                assignee_updated_dates={
+                    job.id: job.assignee_updated_date for job in jobs
+                },
+            )
+
         task_comparison_report = self._compute_task_report(
             job_comparison_reports,
             report_parameters=report_parameters,
@@ -176,36 +252,13 @@ class TaskQualityCalculator:
             all_job_ids=all_job_ids,
         )
 
-        with transaction.atomic():
-            job_quality_reports = {}
-            for job in jobs:
-                job_comparison_report = job_comparison_reports[job.id]
-                job_report = dict(
-                    job=job,
-                    target_last_updated=job.updated_date,
-                    gt_last_updated=gt_job.updated_date,
-                    assignee_id=job.assignee_id,
-                    assignee_last_updated=job.assignee_updated_date,
-                    data=job_comparison_report.to_json(),
-                    conflicts=[c.to_dict() for c in job_comparison_report.get_conflicts()],
-                )
-
-                job_quality_reports[job.id] = job_report
-
-            task_report = self._save_reports(
-                task_report=dict(
-                    task=task,
-                    target_last_updated=task.updated_date,
-                    gt_last_updated=gt_job.updated_date,
-                    assignee_id=task.assignee_id,
-                    assignee_last_updated=task.assignee_updated_date,
-                    data=task_comparison_report.to_json(),
-                    conflicts=[],  # the task doesn't have own conflicts
-                ),
-                job_reports=list(job_quality_reports.values()),
-            )
-
-        return task_report
+        return {
+            "task": task,
+            "bound_generation": bound_generation,
+            "snapshot": snapshot,
+            "task_comparison_report": task_comparison_report,
+            "job_comparison_reports": job_comparison_reports,
+        }
 
     def get_active_validation_frames(self, task: Task, gt_job_data_provider: JobDataProvider):
         active_validation_frames = gt_job_data_provider.job_data.get_included_frames()
@@ -327,66 +380,6 @@ class TaskQualityCalculator:
 
         return task_report_data
 
-    def _save_reports(self, *, task_report: dict, job_reports: list[dict]) -> models.QualityReport:
-        db_task_report = models.QualityReport(
-            task=task_report["task"],
-            target_last_updated=task_report["target_last_updated"],
-            gt_last_updated=task_report["gt_last_updated"],
-            assignee_id=task_report["assignee_id"],
-            assignee_last_updated=task_report["assignee_last_updated"],
-            data=task_report["data"],
-        )
-        db_task_report.save()
-
-        db_job_reports = []
-        for job_report in job_reports:
-            db_job_report = models.QualityReport(
-                job=job_report["job"],
-                target_last_updated=job_report["target_last_updated"],
-                gt_last_updated=job_report["gt_last_updated"],
-                assignee_id=job_report["assignee_id"],
-                assignee_last_updated=job_report["assignee_last_updated"],
-                data=job_report["data"],
-            )
-            db_job_reports.append(db_job_report)
-
-        db_job_reports = db_utils.bulk_create(models.QualityReport, db_job_reports)
-        db_task_report.children.add(*db_job_reports)
-
-        db_conflicts = []
-        db_report_iter = itertools.chain([db_task_report], db_job_reports)
-        report_iter = itertools.chain([task_report], job_reports)
-        for report, db_report in zip(report_iter, db_report_iter):
-            for conflict in report["conflicts"]:
-                db_conflict = models.AnnotationConflict(
-                    report=db_report,
-                    type=conflict["type"],
-                    frame=conflict["frame_id"],
-                    severity=conflict["severity"],
-                    attribute_names=conflict.get("attribute_names", []),
-                )
-                db_conflicts.append(db_conflict)
-
-        db_conflicts = db_utils.bulk_create(models.AnnotationConflict, db_conflicts)
-
-        db_ann_ids = []
-        db_conflicts_iter = iter(db_conflicts)
-        for report in itertools.chain([task_report], job_reports):
-            for conflict, db_conflict in zip(report["conflicts"], db_conflicts_iter):
-                for ann_id in conflict["annotation_ids"]:
-                    db_ann_id = models.AnnotationId(
-                        conflict=db_conflict,
-                        job_id=ann_id["job_id"],
-                        obj_id=ann_id["obj_id"],
-                        type=ann_id["type"],
-                        shape_type=ann_id["shape_type"],
-                    )
-                    db_ann_ids.append(db_ann_id)
-
-        db_utils.bulk_create(models.AnnotationId, db_ann_ids)
-
-        return db_task_report
-
     def get_report_parameters(self, task: Task) -> ComparisonReportParameters:
         quality_settings_manager = QualitySettingsManager()
         task_own_settings = quality_settings_manager.get_task_settings(task, inherit=False)
@@ -397,124 +390,127 @@ class TaskQualityCalculator:
 
 
 class ProjectQualityCalculator:
-    def is_task_report_relevant(self, quality_report: models.QualityReport) -> bool:
-        assert quality_report.target == models.QualityReportTarget.TASK
+    def compute_report(
+        self,
+        project: Project | int,
+        *,
+        generation_id: int | None = None,
+    ) -> models.QualityReport | None:
+        if isinstance(project, int):
+            project = Project.objects.get(id=project)
 
-        task = quality_report.task
-        quality_settings = QualitySettingsManager().get_task_settings(task)
+        bound_generation_id = generation_id
+        for _attempt in range(MAX_STALE_RECOMPUTES + 1):
+            snapshot_outputs = self._compute_project_report_snapshot(
+                project, generation_id=bound_generation_id
+            )
+            if snapshot_outputs is None:
+                return None
 
-        return (quality_report.target_last_updated >= task.updated_date) and (
-            quality_report.target_last_updated >= quality_settings.updated_date
-        )
-
-    def compute_report(self, project: Project | int) -> models.QualityReport:
-        with transaction.atomic():
-            # Preload the required data for computations.
-            # Ideally, we would lock the task to fetch all the data and produce
-            # consistent report. However, data fetching can also take long time.
-            # For this reason, we don't guarantee absolute consistency.
-            if isinstance(project, int):
-                project = Project.objects.get(id=project)
-
-            project_report_parameters = self.get_report_parameters(project)
-            project_requirements = resolve_effective_requirements(
-                list(
-                    QualitySettingsManager()
-                    .get_project_settings(project)
-                    .requirements.select_related("parent")
-                    .all()
+            try:
+                return publish_project_report_family(**snapshot_outputs)
+            except StaleGenerationError as stale_error:
+                ServerLogManager("quality").glob.warning(
+                    "Stale quality report snapshot for project id %s, recomputing "
+                    "(attempt %s/%s): %s %s",
+                    project.id,
+                    _attempt + 1,
+                    MAX_STALE_RECOMPUTES + 1,
+                    stale_error.reason,
+                    stale_error.details,
                 )
-            )
-
-            # Tasks could be added or removed in the project after initial report fetching
-            # Fix working the set of tasks by requesting ids first.
-            all_task_ids: set[int] = set(
-                Task.objects.filter(project=project).values_list("id", flat=True)
-            )
-
-            configured_task_ids: set[int] = set(
-                task_id
-                for ids_chunk in take_by(all_task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE)
-                for task_id in Job.objects.filter(
-                    type=JobType.GROUND_TRUTH,
-                    segment__task__in=ids_chunk,
-                ).values_list("segment__task__id", flat=True)
-            )
-
-            # Prefetch in batches
-            configured_tasks = {}
-            for ids_batch in take_by(configured_task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE):
-                tasks_batch = (
-                    project.tasks.filter(id__in=ids_batch)
-                    .annotate(
-                        latest_quality_report_id=Subquery(
-                            models.QualityReport.objects.filter(
-                                created_date__isnull=False,
-                                task_id=OuterRef("id"),
-                                data__regex=models.CURRENT_REPORT_DATA_REGEX,
-                            )
-                            .order_by("-created_date")
-                            .values("id")[:1]
-                        )
-                    )
-                    .all()
-                )
-                configured_tasks.update((t.id, t) for t in tasks_batch)
-
-                prefetch_related_objects(tasks_batch, "quality_settings")
-
-        latest_quality_report_ids = set(
-            t.latest_quality_report_id for t in configured_tasks.values()
-        )
-        latest_quality_reports = {
-            r.id: r
-            for ids_chunk in take_by(
-                latest_quality_report_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE
-            )
-            for r in models.QualityReport.objects.filter(id__in=ids_chunk)
-        }
-
-        task_quality_reports: dict[int, models.QualityReport] = {}
-        for task in configured_tasks.values():
-            latest_task_quality_report_id = getattr(task, "latest_quality_report_id", None)
-            latest_task_quality_report = latest_quality_reports.get(latest_task_quality_report_id)
-            if not latest_task_quality_report:
+                bound_generation_id = None
                 continue
 
-            latest_task_quality_report.task = task  # put the prefetched object
-            if not self.is_task_report_relevant(latest_task_quality_report):
-                continue
+        ServerLogManager("quality").glob.warning(
+            "Discarding stale quality report computation for project id %s: "
+            "the rules/data generation kept changing; returning the current report",
+            project.id,
+        )
+        return get_current_project_report(project.id)
 
-            task_quality_reports[task.id] = latest_task_quality_report
+    def _compute_project_report_snapshot(
+        self,
+        project: Project,
+        *,
+        generation_id: int | None,
+    ) -> dict | None:
+        project = Project.objects.get(id=project.id)
+        project_settings = QualitySettingsManager().get_project_settings(project)
+        project_report_parameters = self.get_report_parameters(project)
+        project_requirements = resolve_effective_requirements(
+            list(project_settings.requirements.select_related("parent").all())
+        )
 
-        # Compute required task reports
-        # This loop can take long time, maybe use RQ dependencies for each task instead
-        tasks_without_reports = configured_tasks.keys() - task_quality_reports.keys()
-        for ids_batch in take_by(tasks_without_reports, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE):
-            tasks_batch = [configured_tasks[task_id] for task_id in ids_batch]
+        bound_generation = (
+            models.QualityRulesGeneration.objects.get(id=generation_id)
+            if generation_id is not None
+            else None
+        )
+        if bound_generation is None:
+            bound_generation = get_current_rules_generation(project=project)
 
-            prefetch_related_objects(
-                tasks_batch,
-                "data",
-                "data__validation_layout",
+        # Pin the task set first; tasks added/removed later belong to the next
+        # project generation.
+        all_task_ids: set[int] = set(
+            Task.objects.filter(project=project).values_list("id", flat=True)
+        )
+
+        configured_task_ids: set[int] = set(
+            task_id
+            for ids_chunk in take_by(all_task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE)
+            for task_id in Job.objects.filter(
+                type=JobType.GROUND_TRUTH,
+                segment__task__in=ids_chunk,
+            ).values_list("segment__task__id", flat=True)
+        )
+
+        configured_tasks: dict[int, Task] = {}
+        for ids_batch in take_by(configured_task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE):
+            tasks_batch = list(
+                Task.objects.filter(id__in=ids_batch).select_related("quality_settings")
             )
+            configured_tasks.update((t.id, t) for t in tasks_batch)
 
-            for task in tasks_batch:
-                if task.id in task_quality_reports:
+        task_families = self._get_current_task_families(configured_task_ids)
+        gt_updated_dates = self._get_gt_job_updated_dates(configured_task_ids)
+        task_jobs = self._get_task_jobs(configured_task_ids)
+
+        selected_families: dict[int, models.QualityReport] = {}
+        for task_id, task in configured_tasks.items():
+            family = task_families.get(task_id)
+            task_settings = self._get_task_own_settings(task)
+
+            if family is not None:
+                inherits_project = self._task_inherits_project(task, task_settings)
+                fingerprint_matches = (
+                    not inherits_project
+                    or family.generation.fingerprint == bound_generation.fingerprint
+                )
+                if fingerprint_matches and self._task_family_is_fresh(
+                    family,
+                    task=task,
+                    gt_updated=gt_updated_dates.get(task_id),
+                    jobs=task_jobs.get(task_id, []),
+                ):
+                    selected_families[task_id] = family
                     continue
 
-                # Tasks could have been deleted during report computations, ignore them.
-                # Tasks could be moved between projects. It can't be
-                # reliably checked and it is quite rare, so we ignore it.
-                with suppress(Task.DoesNotExist):
-                    task_report_calculator = TaskQualityCalculator()
-                    task_report = task_report_calculator.compute_report(task)
-                    if task_report:
-                        task_quality_reports[task.id] = task_report
+            # Deterministic inline recomputation under the task's current
+            # generation. For inheriting tasks this is the same fingerprint as
+            # the bound project generation; otherwise it is the task's own one.
+            with suppress(Task.DoesNotExist):
+                task_generation_id = get_current_rules_generation(task=task).id
+                new_family = TaskQualityCalculator().compute_report(
+                    task,
+                    generation_id=task_generation_id,
+                )
+                if new_family is not None:
+                    selected_families[task_id] = new_family
 
         task_comparison_reports: dict[int, ComparisonReport] = {
-            task_id: ComparisonReport.from_json(r.get_report_data())
-            for task_id, r in task_quality_reports.items()
+            task_id: ComparisonReport.from_json(family.get_report_data())
+            for task_id, family in selected_families.items()
         }
 
         project_comparison_report = self._compute_project_report(
@@ -524,21 +520,110 @@ class ProjectQualityCalculator:
             all_task_ids=all_task_ids,
         )
 
-        with transaction.atomic():
-            project_report = self._save_report(
-                models.QualityReport(
-                    project=project,
-                    target_last_updated=project.updated_date,
-                    gt_last_updated=None,
-                    data=project_comparison_report.to_json(),
-                    # project reports don't include conflicts
-                ),
-                child_reports=[
-                    r for r in task_quality_reports.values() if r.task.id in task_comparison_reports
-                ],
-            )
+        snapshot = ProjectReportSnapshot(
+            generation_id=bound_generation.id,
+            project_target_updated=project.updated_date,
+            task_family_ids=frozenset(family.id for family in selected_families.values()),
+        )
 
-        return project_report
+        return {
+            "project": project,
+            "bound_generation": bound_generation,
+            "snapshot": snapshot,
+            "project_comparison_report": project_comparison_report,
+            "task_families": selected_families,
+        }
+
+    @staticmethod
+    def _get_task_own_settings(task: Task) -> models.QualitySettings:
+        return task.quality_settings
+
+    @staticmethod
+    def _task_inherits_project(
+        task: Task, own_settings: models.QualitySettings
+    ) -> bool:
+        return bool(task.project_id and own_settings.inherit)
+
+    @staticmethod
+    def _get_current_task_families(
+        task_ids: set[int],
+    ) -> dict[int, models.QualityReport]:
+        families: dict[int, models.QualityReport] = {}
+        for ids_batch in take_by(task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE):
+            for family in models.QualityReport.objects.filter(
+                task_id__in=ids_batch,
+                status=models.QualityReportStatus.CURRENT,
+            ).prefetch_related("children"):
+                families[family.task_id] = family
+
+        return families
+
+    @staticmethod
+    def _get_gt_job_updated_dates(task_ids: set[int]) -> dict[int, datetime]:
+        dates: dict[int, datetime] = {}
+        for ids_batch in take_by(task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE):
+            rows = (
+                Job.objects.filter(type=JobType.GROUND_TRUTH, segment__task__in=ids_batch)
+                .values("segment__task_id", "updated_date")
+            )
+            dates.update({row["segment__task_id"]: row["updated_date"] for row in rows})
+        return dates
+
+    @staticmethod
+    def _get_task_jobs(task_ids: set[int]) -> dict[int, list[Job]]:
+        jobs_by_task: dict[int, list[Job]] = {task_id: [] for task_id in task_ids}
+        for ids_batch in take_by(task_ids, chunk_size=_DEFAULT_FETCH_CHUNK_SIZE):
+            for job in Job.objects.filter(
+                segment__task__in=ids_batch
+            ).exclude(type=JobType.GROUND_TRUTH):
+                jobs_by_task.setdefault(job.segment.task_id, []).append(job)
+        return jobs_by_task
+
+    @staticmethod
+    def _task_family_is_fresh(
+        family: models.QualityReport,
+        *,
+        task: Task,
+        gt_updated: datetime | None,
+        jobs: list[Job],
+    ) -> bool:
+        if family.status != models.QualityReportStatus.CURRENT:
+            return False
+        if family.target_last_updated < task.updated_date:
+            return False
+        if gt_updated is None or (
+            family.gt_last_updated is None or family.gt_last_updated < gt_updated
+        ):
+            return False
+
+        summary = family.summary
+        # Sets are serialized as lists in the report JSON
+        acceptable_without_report = (
+            set(summary.jobs.excluded) | set(summary.jobs.not_checkable)
+        )
+
+        child_reports = {
+            child.job_id: child
+            for child in family.children.all()
+            if child.job_id is not None
+        }
+        for job in jobs:
+            child = child_reports.get(job.id)
+            if child is None:
+                if job.id not in acceptable_without_report:
+                    return False
+                continue
+
+            if child.status != models.QualityReportStatus.CURRENT:
+                return False
+            if child.target_last_updated < job.updated_date:
+                return False
+            if child.assignee_id != job.assignee_id:
+                return False
+            if child.assignee_last_updated != job.assignee_updated_date:
+                return False
+
+        return True
 
     def _compute_project_report(
         self,
@@ -686,14 +771,6 @@ class ProjectQualityCalculator:
         )
 
         return project_report_data
-
-    def _save_report(
-        self, project_report: models.QualityReport, child_reports: list[models.QualityReport]
-    ) -> models.QualityReport:
-        project_report.save()
-        project_report.children.add(*child_reports)
-
-        return project_report
 
     def get_report_parameters(self, project: Project) -> ComparisonReportParameters:
         quality_settings = QualitySettingsManager().get_project_settings(project)

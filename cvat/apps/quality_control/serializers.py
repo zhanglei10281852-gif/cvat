@@ -242,6 +242,10 @@ class QualityReportListSerializer(serializers.ListSerializer):
 
 class QualityReportSerializer(serializers.ModelSerializer):
     target = QualityReportTargetSerializer()
+    status = serializers.SerializerMethodField(
+        help_text="'legacy' for reports created before rules generations"
+    )
+    generation_id = serializers.IntegerField(read_only=True, allow_null=True)
     assignee = engine_serializers.BasicUserSerializer(allow_null=True, read_only=True)
     summary = QualityReportSummarySerializer()
     parent_id = serializers.IntegerField(default=None, allow_null=True, read_only=True)
@@ -252,6 +256,9 @@ class QualityReportSerializer(serializers.ModelSerializer):
         source="get_project.id", default=None, allow_null=True, read_only=True
     )
 
+    def get_status(self, instance: models.QualityReport) -> str:
+        return instance.status or "legacy"
+
     class Meta:
         model = models.QualityReport
         fields = (
@@ -261,6 +268,8 @@ class QualityReportSerializer(serializers.ModelSerializer):
             "project_id",
             "parent_id",
             "target",
+            "status",
+            "generation_id",
             "summary",
             "created_date",
             "target_last_updated",
@@ -273,6 +282,10 @@ class QualityReportSerializer(serializers.ModelSerializer):
 
 class QualityReportListQuerySerializer(serializers.Serializer):
     include_legacy = serializers.BooleanField(required=False, default=False)
+    status = serializers.MultipleChoiceField(
+        choices=("current", "superseded", "legacy"),
+        required=False,
+    )
 
 
 class QualityReportCreateSerializer(serializers.Serializer):
@@ -854,7 +867,9 @@ class QualityRequirementSerializer(serializers.ModelSerializer):
 
     @staticmethod
     def _touch_settings(settings: models.QualitySettings) -> None:
-        settings.save()
+        from cvat.apps.quality_control.generation import bump_rules_version
+
+        bump_rules_version(settings)
 
     def _should_touch_settings(self) -> bool:
         return self.context.get("touch_settings", True)
@@ -1117,7 +1132,9 @@ class QualityRequirementBulkCreateSerializer(serializers.Serializer):
                     path=(("requirements", index),),
                 )
 
-            quality_settings.save()
+            from cvat.apps.quality_control.generation import bump_rules_version
+
+            bump_rules_version(quality_settings)
 
         return created_requirements
 
@@ -1421,20 +1438,42 @@ class QualitySettingsSerializer(WriteOnceMixin, serializers.ModelSerializer):
             child_serializer.save()
 
     def to_representation(self, instance):
-        models.ensure_base_quality_requirements(instance)
+        # Settings created before base requirements existed may miss them.
+        # Re-creating them (and advancing the rules version) are a single
+        # atomic write, otherwise a failure between the statements would leave
+        # new effective content attached to an unchanged version descriptor.
+        with transaction.atomic():
+            bases_created = models.ensure_base_quality_requirements(instance)
+            if bases_created:
+                from cvat.apps.quality_control.generation import bump_rules_version
+
+                bump_rules_version(instance)
         return super().to_representation(instance)
+
+    _TRACKED_SCALAR_FIELDS = ("job_filter", "inherit", "max_validations_per_job")
 
     def update(self, instance, validated_data):
         requirements_data = validated_data.pop("requirements", serializers.empty)
 
+        scalars_changed = any(
+            field_name in validated_data
+            and getattr(instance, field_name) != validated_data[field_name]
+            for field_name in self._TRACKED_SCALAR_FIELDS
+        )
+        requirements_replaced = requirements_data is not serializers.empty
+
         with transaction.atomic():
-            models.ensure_base_quality_requirements(instance)
+            bases_created = models.ensure_base_quality_requirements(instance)
             instance = super().update(instance, validated_data)
 
-            if requirements_data is not serializers.empty:
+            if requirements_replaced:
                 self._sync_requirements(instance, requirements_data)
                 db_utils.clear_prefetched_relation_cache(instance, "requirements")
-                instance.touch()
+
+            if scalars_changed or requirements_replaced or bases_created:
+                from cvat.apps.quality_control.generation import bump_rules_version
+
+                bump_rules_version(instance)
 
             if instance.task_id:
                 instance.task.touch()

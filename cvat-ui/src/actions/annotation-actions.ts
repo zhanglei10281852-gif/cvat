@@ -11,7 +11,7 @@ import {
     RectDrawingMethod, CuboidDrawingMethod, Canvas, CanvasMode as Canvas2DMode, CanvasHistorySource,
 } from 'cvat-canvas-wrapper';
 import {
-    getCore, MLModel, JobType, Job, QualityConflict,
+    getCore, MLModel, JobType, Job, QualityConflict, QualityReportStatus,
     ObjectState, ObjectType, ShapeType, JobState, JobValidationLayout,
     DimensionType, Source, AudioIntervalState,
 } from 'cvat-core-wrapper';
@@ -1089,7 +1089,14 @@ export function getJobAsync({
 
             let conflicts: QualityConflict[] = [];
             if (gtJob) {
-                const [report] = await cvat.analytics.quality.reports({ jobID: job.id, target: 'job' });
+                // Only the current rules-generation family may back the visible result;
+                // legacy reports remain a fallback until a generation-bound report exists.
+                // Superseded reports (mixed snapshots) must never be selected here.
+                const [report] = await cvat.analytics.quality.reports({
+                    jobID: job.id,
+                    target: 'job',
+                    status: [QualityReportStatus.CURRENT, QualityReportStatus.LEGACY],
+                });
                 if (report) {
                     conflicts = await cvat.analytics.quality.conflicts({ reportID: report.id });
                 }

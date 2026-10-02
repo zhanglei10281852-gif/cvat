@@ -27,7 +27,8 @@ import { UpdateStatusData } from 'cvat-core/src/core-types';
 import { Job, Task } from 'cvat-core/src/session';
 import Project from 'cvat-core/src/project';
 import {
-    AnnotationConflict, ConflictSeverity, QualityConflict, QualityReport, QualityRequirement,
+    AnnotationConflict, ConflictSeverity, QualityConflict, QualityReport, QualityReportStatus,
+    QualityRequirement,
     QualityRequirementSaveFields, QualitySettings, QualitySettingsSaveFields, QualitySummary,
     QualityReportScoreComponents, QualityReportRequirementCalculation, QualityReportRequirementSummaryItem,
     QualityReportRequirementCalculationStatus, QualityReportRequirementCalculationReason,
@@ -121,6 +122,7 @@ export {
     BaseShapesAction,
     BaseCollectionAction,
     QualityReport,
+    QualityReportStatus,
     QualityConflict,
     QualitySettings,
     QualityRequirement,

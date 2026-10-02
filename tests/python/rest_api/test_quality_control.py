@@ -2026,6 +2026,123 @@ class TestQualityReportContents(_PermissionTestBase):
 
 
 @pytest.mark.usefixtures("restore_db_per_function")
+class TestQualityReportGenerations(_PermissionTestBase):
+    demo_task_id = 22
+
+    def _list_reports(self, user: str, **kwargs) -> list[dict[str, Any]]:
+        with make_api_client(user) as api_client:
+            return get_paginated_collection(
+                api_client.quality_api.list_reports_endpoint,
+                return_json=True,
+                **kwargs,
+            )
+
+    def _list_job_reports_for_task(self, user: str, task_report: dict[str, Any]):
+        return self._list_reports(
+            user, target="job", parent_id=task_report["id"]
+        )
+
+    def test_report_exposes_generation_and_status(self, admin_user):
+        report = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+        self.assertEqual(report["status"], "current")
+        self.assertIsInstance(report["generation_id"], int)
+
+        current = self._list_reports(
+            admin_user, target="task", task_id=self.demo_task_id, status="current"
+        )
+        self.assertIn(report["id"], {r["id"] for r in current})
+
+        superseded = self._list_reports(
+            admin_user, target="task", task_id=self.demo_task_id, status="superseded"
+        )
+        self.assertNotIn(report["id"], {r["id"] for r in superseded})
+
+    def test_recompute_after_rules_change_binds_new_generation(self, admin_user):
+        first = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+
+        settings = self.get_task_quality_settings(admin_user, self.demo_task_id)
+        response = patch_method(
+            admin_user,
+            f"quality/settings/{settings['id']}",
+            {"max_validations_per_job": 1},
+        )
+        assert response.status_code == HTTPStatus.OK
+
+        second = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+        self.assertNotEqual(first["generation_id"], second["generation_id"])
+        self.assertEqual(second["status"], "current")
+
+    def test_manual_recompute_without_changes_is_idempotent(self, admin_user):
+        first = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+        second = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["generation_id"], second["generation_id"])
+
+        task_reports = self._list_reports(
+            admin_user, target="task", task_id=self.demo_task_id
+        )
+        self.assertEqual(
+            [r["id"] for r in task_reports if r["status"] == "current"],
+            [first["id"]],
+        )
+
+    def test_recompute_after_annotation_change_publishes_new_current_family(
+        self, admin_user
+    ):
+        first = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+        first_job_reports = self._list_job_reports_for_task(admin_user, first)
+        self.assertTrue(first_job_reports)
+        old_job_report_ids = {r["id"] for r in first_job_reports}
+
+        with make_api_client(admin_user) as api_client:
+            api_client.tasks_api.update_annotations(
+                self.demo_task_id, labeled_data_request={"shapes": []}
+            )
+
+        second = create_quality_report(user=admin_user, task_id=self.demo_task_id)
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(second["status"], "current")
+
+        task_roots = self._list_reports(
+            admin_user, target="task", task_id=self.demo_task_id
+        )
+        by_id = {r["id"]: r for r in task_roots}
+        self.assertEqual(by_id[first["id"]]["status"], "superseded")
+        self.assertEqual(by_id[second["id"]]["status"], "current")
+
+        second_job_reports = self._list_job_reports_for_task(admin_user, second)
+        new_job_report_ids = {r["id"] for r in second_job_reports}
+        self.assertTrue(new_job_report_ids)
+        self.assertTrue(new_job_report_ids.isdisjoint(old_job_report_ids))
+        self.assertTrue(all(r["status"] == "current" for r in second_job_reports))
+
+        # The task-scoped conflict list exposes only the current family;
+        # the old family conflicts (the demo task has some) are not leaked
+        current_conflicts = self._list_current_conflicts(admin_user)
+        conflict_report_ids = {c["report_id"] for c in current_conflicts}
+        self.assertTrue(conflict_report_ids.issubset(new_job_report_ids))
+        self.assertFalse(conflict_report_ids & old_job_report_ids)
+
+        # Historical conflicts remain readable through their owning report
+        old_job_report_id = next(iter(old_job_report_ids))
+        with make_api_client(admin_user) as api_client:
+            historical = get_paginated_collection(
+                api_client.quality_api.list_conflicts,
+                report_id=old_job_report_id,
+                return_json=True,
+            )
+        self.assertTrue(historical)
+
+    def _list_current_conflicts(self, user: str) -> list[dict[str, Any]]:
+        with make_api_client(user) as api_client:
+            return get_paginated_collection(
+                api_client.quality_api.list_conflicts,
+                task_id=self.demo_task_id,
+                return_json=True,
+            )
+
+
+@pytest.mark.usefixtures("restore_db_per_function")
 class TestPostProjectQualityReports(_PermissionTestBase):
     def _test_create_report_200(self, user: str, project_id: int):
         return create_quality_report(user=user, project_id=project_id)

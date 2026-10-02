@@ -1,0 +1,2 @@
+class VideoStream:
+    pass

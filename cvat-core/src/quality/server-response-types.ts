@@ -250,6 +250,8 @@ export interface SerializedQualityConflictData {
     attribute_names: string[];
 }
 
+export type SerializedQualityReportStatus = 'current' | 'superseded' | 'legacy';
+
 export interface SerializedQualityReportData {
     id: number;
     parent_id: number | null;
@@ -257,6 +259,8 @@ export interface SerializedQualityReportData {
     task_id: number | null;
     job_id: number | null;
     target: string;
+    status?: SerializedQualityReportStatus;
+    generation_id?: number | null;
     created_date: string;
     target_last_updated: string | null;
     gt_last_updated: string | null;

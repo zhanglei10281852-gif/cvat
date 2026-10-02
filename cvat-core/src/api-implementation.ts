@@ -455,6 +455,10 @@ export default function implementAPI(cvat: CVATCore): CVATCore {
             taskID: isInteger,
             jobID: isInteger,
             target: isString,
+            status: (value: unknown) => (
+                isString(value) || (Array.isArray(value) && value.every(isString))
+            ),
+            includeLegacy: isBoolean,
             filter: isString,
             search: isString,
             sort: isString,

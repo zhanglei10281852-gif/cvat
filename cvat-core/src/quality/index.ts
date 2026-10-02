@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 export { default as QualityConflict, AnnotationConflict, ConflictSeverity } from './quality-conflict';
-export { default as QualityReport } from './quality-report';
+export { default as QualityReport, QualityReportStatus } from './quality-report';
 export type {
     QualitySummary, QualityReportScoreComponents, QualityReportRequirementCalculation,
     QualityReportRequirementSummaryItem,

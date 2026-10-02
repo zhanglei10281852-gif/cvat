@@ -9,6 +9,12 @@ import {
 import { fieldsToCamelCase } from '../common';
 import User from '../user';
 
+export enum QualityReportStatus {
+    CURRENT = 'current',
+    SUPERSEDED = 'superseded',
+    LEGACY = 'legacy',
+}
+
 export interface QualityReportScoreComponents {
     validCount: number;
     missingCount: number;
@@ -76,6 +82,8 @@ export default class QualityReport {
     #taskID: number;
     #jobID: number;
     #target: string;
+    #status: QualityReportStatus;
+    #generationId: number | null;
     #createdDate: string;
     #gtLastUpdated: string;
     #assignee: User | null;
@@ -88,6 +96,11 @@ export default class QualityReport {
         this.#taskID = initialData.task_id;
         this.#jobID = initialData.job_id;
         this.#target = initialData.target;
+        // Reports produced by older servers carry no status/generation,
+        // treat them as legacy so that current-family selection still works.
+        this.#status = (initialData.status ??
+            QualityReportStatus.LEGACY) as QualityReportStatus;
+        this.#generationId = initialData.generation_id ?? null;
         this.#gtLastUpdated = initialData.gt_last_updated;
         this.#createdDate = initialData.created_date;
         this.#summary = initialData.summary;
@@ -121,6 +134,14 @@ export default class QualityReport {
 
     get target(): string {
         return this.#target;
+    }
+
+    get status(): QualityReportStatus {
+        return this.#status;
+    }
+
+    get generationId(): number | null {
+        return this.#generationId;
     }
 
     get gtLastUpdated(): string {
