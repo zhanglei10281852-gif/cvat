@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import re
 import shutil
 import uuid
@@ -29,7 +30,10 @@ from django.utils.translation import gettext_lazy as _
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 
-from cvat.apps.engine.exceptions import CloudStorageMissingError
+from cvat.apps.engine.exceptions import (
+    BackingCSMigrationConflictError,
+    CloudStorageMissingError,
+)
 from cvat.apps.engine.lazy_list import LazyList
 from cvat.apps.engine.utils import parse_specific_attributes, take_by
 from cvat.apps.events.utils import cache_deleted
@@ -655,60 +659,330 @@ class Data(models.Model):
 
         return False
 
+    _BACKING_CS_MIGRATION_MAX_ATTEMPTS = 3
+
     def move_to_backing_cs(self, backing_cs: CloudStorage) -> None:
-        assert self.supports_backing_cs(backing_cs)
-        assert not self.local_storage_backing_cs_id
-
-        self.local_storage_backing_cs = backing_cs
-
-        storage_client = self.get_cloud_storage_client()
-        assert storage_client
-
-        upload_dir = self.get_upload_dirname()
-
-        rel_paths_to_move = self.get_all_media_rel_paths()
-
-        storage_client.bulk_upload_from_dir(rel_paths_to_move, upload_dir)
-
-        self.save(update_fields=["local_storage_backing_cs"])
-
-        def clear_original_files() -> None:
-            parents = set()
-
-            for path in rel_paths_to_move:
-                (upload_dir / path).unlink()
-                parents.update(path.parents)
-
-            # Delete all empty parent directories, except for upload_dir itself.
-            parents.remove(PurePath())
-
-            for parent in sorted(parents, key=lambda path: -len(path.parts)):
-                try:
-                    (upload_dir / parent).rmdir()
-                except OSError:
-                    pass
-
-        transaction.on_commit(clear_original_files, robust=True)
+        migration = self._claim_backing_cs_migration(
+            direction=BackingCSMigration.Direction.TO_BACKING_CS,
+            target_cs=backing_cs,
+        )
+        self._run_backing_cs_migration(migration)
 
     def move_from_backing_cs(self) -> None:
-        assert self.local_storage_backing_cs_id
+        # The target storage is the currently published backing CS (or the one
+        # recorded by an in-progress migration being resumed).
+        migration = self._claim_backing_cs_migration(
+            direction=BackingCSMigration.Direction.FROM_BACKING_CS,
+            target_cs=self.local_storage_backing_cs,
+        )
+        self._run_backing_cs_migration(migration)
 
-        storage_client = self.get_cloud_storage_client()
-        assert storage_client
+    def _claim_backing_cs_migration(
+        self,
+        *,
+        direction: BackingCSMigration.Direction,
+        target_cs: CloudStorage | None,
+    ) -> BackingCSMigration:
+        """
+        Atomically creates a migration record or resumes an existing compatible one.
+        An incompatible (e.g. opposite-direction) migration in progress is an error,
+        which makes concurrent commands converge to a single migration result.
+        """
 
-        upload_dir = self.get_upload_dirname()
+        with transaction.atomic():
+            # Locking the Data row serializes concurrent claims, so only one
+            # migration record can be created for a given data object.
+            locked_data = (
+                Data.objects.select_for_update()
+                .select_related("backing_cs_migration")
+                .get(pk=self.pk)
+            )
 
+            migration: BackingCSMigration | None = getattr(
+                locked_data, "backing_cs_migration", None
+            )
+
+            if migration is None:
+                if target_cs is None:
+                    raise BackingCSMigrationConflictError(
+                        f"Task #{self.id} has no backing cloud storage migration in progress"
+                    )
+
+                migration = BackingCSMigration.objects.create(
+                    data=locked_data,
+                    direction=direction,
+                    stage=BackingCSMigration.Stage.COPY,
+                    target_cs=target_cs,
+                )
+            elif (
+                migration.direction != direction
+                or (target_cs is not None and migration.target_cs_id != target_cs.id)
+            ):
+                raise BackingCSMigrationConflictError(
+                    f"Task #{self.id} has a backing cloud storage migration in progress"
+                    f" (direction: {migration.get_direction_display()},"
+                    f" target cloud storage #{migration.target_cs_id}, stage:"
+                    f" {migration.get_stage_display()})"
+                )
+
+        return migration
+
+    def _run_backing_cs_migration(self, migration: BackingCSMigration) -> None:
         rel_paths_to_move = self.get_all_media_rel_paths()
 
-        storage_client.bulk_download_to_dir(rel_paths_to_move, upload_dir)
+        if migration.stage == BackingCSMigration.Stage.COPY:
+            if migration.direction == BackingCSMigration.Direction.TO_BACKING_CS:
+                self._copy_local_media_to_backing_cs(migration.target_cs, rel_paths_to_move)
+            else:
+                self._copy_backing_cs_media_to_local(migration.target_cs, rel_paths_to_move)
 
-        self.local_storage_backing_cs = None
-        self.save(update_fields=["local_storage_backing_cs"])
+            migration = self._publish_backing_cs_switch(migration, rel_paths_to_move)
 
-        def clear_original_files() -> None:
-            storage_client.bulk_delete([p.as_posix() for p in rel_paths_to_move])
+        # Remove the source files. Inside an open outer transaction (e.g. task creation
+        # via initialize_task), defer the cleanup until that transaction is committed.
+        # If the process exits before the cleanup finishes, the persisted CLEAN stage
+        # allows safely resuming it.
+        connection = transaction.get_connection()
+        if connection.in_atomic_block:
+            transaction.on_commit(
+                functools.partial(
+                    self._finish_backing_cs_migration,
+                    migration_id=migration.id,
+                    rel_paths_to_move=rel_paths_to_move,
+                ),
+                robust=True,
+            )
+        else:
+            self._finish_backing_cs_migration(
+                migration_id=migration.id,
+                rel_paths_to_move=rel_paths_to_move,
+            )
 
-        transaction.on_commit(clear_original_files, robust=True)
+    def _copy_local_media_to_backing_cs(
+        self, backing_cs: CloudStorage, rel_paths_to_move: Sequence[PurePath]
+    ) -> None:
+        upload_dir = self.get_upload_dirname()
+        storage_client = self._make_backing_cs_storage_client(backing_cs)
+        keys = [path.as_posix() for path in rel_paths_to_move]
+
+        # Files copied in a previous (interrupted) run and matching the source size
+        # are considered done; partially copied or missing files are re-uploaded.
+        for _ in range(self._BACKING_CS_MIGRATION_MAX_ATTEMPTS):
+            target_sizes = storage_client.bulk_get_file_sizes(keys)
+            paths_to_copy = [
+                path
+                for path in rel_paths_to_move
+                if target_sizes.get(path.as_posix())
+                != (upload_dir / path).stat().st_size
+            ]
+            if not paths_to_copy:
+                return
+
+            storage_client.bulk_upload_from_dir(paths_to_copy, upload_dir)
+
+        raise RuntimeError(
+            f"Failed to verify all files at backing cloud storage #{backing_cs.id}"
+            f" after {self._BACKING_CS_MIGRATION_MAX_ATTEMPTS} attempt(s)"
+        )
+
+    def _copy_backing_cs_media_to_local(
+        self, backing_cs: CloudStorage, rel_paths_to_move: Sequence[PurePath]
+    ) -> None:
+        upload_dir = self.get_upload_dirname()
+        storage_client = self._make_backing_cs_storage_client(backing_cs)
+        keys = [path.as_posix() for path in rel_paths_to_move]
+
+        for _ in range(self._BACKING_CS_MIGRATION_MAX_ATTEMPTS):
+            source_sizes = storage_client.bulk_get_file_sizes(keys)
+            paths_to_copy = []
+            for path in rel_paths_to_move:
+                key = path.as_posix()
+                source_size = source_sizes.get(key)
+                if source_size is None:
+                    raise RuntimeError(
+                        f"Source file '{key}' is missing on backing cloud storage"
+                        f" #{backing_cs.id}"
+                    )
+
+                local_path = upload_dir / path
+                try:
+                    local_size = local_path.stat().st_size
+                except FileNotFoundError:
+                    local_size = None
+
+                if local_size != source_size:
+                    paths_to_copy.append(path)
+
+            if not paths_to_copy:
+                return
+
+            storage_client.bulk_download_to_dir(paths_to_copy, upload_dir)
+
+        raise RuntimeError(
+            f"Failed to verify all files at the local filesystem after downloading from"
+            f" backing cloud storage #{backing_cs.id} after"
+            f" {self._BACKING_CS_MIGRATION_MAX_ATTEMPTS} attempt(s)"
+        )
+
+    def _publish_backing_cs_switch(
+        self, migration: BackingCSMigration, rel_paths_to_move: Sequence[PurePath]
+    ) -> BackingCSMigration:
+        """
+        Publishes the new media location after every target file has been verified.
+        Atomic and idempotent: a concurrent duplicate command performing the same
+        switch does not change the result.
+        """
+
+        with transaction.atomic():
+            locked_data = Data.objects.select_for_update().get(pk=self.pk)
+            locked_migration = BackingCSMigration.objects.select_for_update().get(
+                pk=migration.pk
+            )
+
+            if locked_migration.stage == BackingCSMigration.Stage.COPY:
+                if migration.direction == BackingCSMigration.Direction.TO_BACKING_CS:
+                    locked_data.local_storage_backing_cs_id = locked_migration.target_cs_id
+                else:
+                    locked_data.local_storage_backing_cs_id = None
+
+                locked_data.save(update_fields=["local_storage_backing_cs"])
+
+                locked_migration.stage = BackingCSMigration.Stage.CLEAN
+                locked_migration.save(update_fields=["stage"])
+
+            self.local_storage_backing_cs_id = locked_data.local_storage_backing_cs_id
+
+        return locked_migration
+
+    def _finish_backing_cs_migration(
+        self,
+        *,
+        migration_id: int,
+        rel_paths_to_move: Sequence[PurePath],
+    ) -> None:
+        """
+        Removes all source files and then the migration record.
+        Every step is idempotent, so an interrupted cleanup is safely resumed
+        by re-running the command.
+        """
+
+        try:
+            migration = BackingCSMigration.objects.select_related("target_cs").get(
+                pk=migration_id
+            )
+        except BackingCSMigration.DoesNotExist:
+            # A concurrent duplicate command has finished the migration already.
+            return
+
+        if migration.stage != BackingCSMigration.Stage.CLEAN:
+            # The switch was rolled back; there is nothing to clean up.
+            return
+
+        if migration.direction == BackingCSMigration.Direction.TO_BACKING_CS:
+            self._remove_local_media_after_switch(rel_paths_to_move)
+        else:
+            self._remove_backing_cs_media_after_switch(
+                migration.target_cs, rel_paths_to_move
+            )
+
+        with transaction.atomic():
+            # A concurrent duplicate may have removed the record in the meantime.
+            BackingCSMigration.objects.filter(
+                pk=migration.id, stage=BackingCSMigration.Stage.CLEAN
+            ).delete()
+
+    def _remove_local_media_after_switch(self, rel_paths_to_move: Sequence[PurePath]) -> None:
+        upload_dir = self.get_upload_dirname()
+
+        parents = set()
+
+        for path in rel_paths_to_move:
+            try:
+                (upload_dir / path).unlink()
+            except FileNotFoundError:
+                # Already removed in a previous (interrupted) run.
+                pass
+
+            parents.update(path.parents)
+
+        # Delete all empty parent directories, except for upload_dir itself.
+        parents.discard(PurePath())
+
+        for parent in sorted(parents, key=lambda path: -len(path.parts)):
+            try:
+                (upload_dir / parent).rmdir()
+            except OSError:
+                pass
+
+    def _remove_backing_cs_media_after_switch(
+        self, backing_cs: CloudStorage, rel_paths_to_move: Sequence[PurePath]
+    ) -> None:
+        storage_client = self._make_backing_cs_storage_client(backing_cs)
+        keys = [path.as_posix() for path in rel_paths_to_move]
+
+        for _ in range(self._BACKING_CS_MIGRATION_MAX_ATTEMPTS):
+            # Only delete objects that are still present, so re-running the cleanup
+            # after an interruption is a safe no-op for already removed files.
+            sizes = storage_client.bulk_get_file_sizes(keys)
+            keys_to_delete = [key for key, size in sizes.items() if size is not None]
+            if not keys_to_delete:
+                return
+
+            storage_client.bulk_delete(keys_to_delete)
+
+        remaining = [
+            key
+            for key, size in storage_client.bulk_get_file_sizes(keys).items()
+            if size is not None
+        ]
+        if remaining:
+            raise RuntimeError(
+                f"Failed to remove files from backing cloud storage #{backing_cs.id}:"
+                f" {remaining}"
+            )
+
+    def _make_backing_cs_storage_client(self, backing_cs: CloudStorage) -> CloudStorageClient:
+        from .cloud_provider import SubdirectoryCloudStorageClient
+
+        return SubdirectoryCloudStorageClient(
+            backing_cs.get_client(is_trusted=True),
+            f"data/{self.id}/raw",
+        )
+
+
+class BackingCSMigration(models.Model):
+    """
+    Holds the state of a single recoverable migration of a Data object's media
+    between the local filesystem and a backing cloud storage.
+
+    The published media location is 'Data.local_storage_backing_cs' and never changes
+    until every file has been copied to and verified at the target location (stage
+    transition COPY -> CLEAN). After the switch, the source files are removed; this
+    final cleanup is idempotent and can be safely resumed after an interruption.
+    """
+
+    class Direction(TextChoices):
+        TO_BACKING_CS = "to_backing_cs", "to the backing cloud storage"
+        FROM_BACKING_CS = "from_backing_cs", "from the backing cloud storage"
+
+    class Stage(TextChoices):
+        # Files are being copied to the target location.
+        # Readers keep using the old location in this stage.
+        COPY = "copy", "Copying"
+        # The location pointer has been switched; source files are being removed.
+        CLEAN = "clean", "Cleaning up the source"
+
+    data = models.OneToOneField(
+        Data, on_delete=models.CASCADE, related_name="backing_cs_migration"
+    )
+    direction = models.CharField(max_length=32, choices=Direction.choices)
+    stage = models.CharField(max_length=16, choices=Stage.choices, default=Stage.COPY)
+    # For TO_BACKING_CS: the destination storage; for FROM_BACKING_CS: the storage left.
+    target_cs = models.ForeignKey(CloudStorage, on_delete=models.PROTECT, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        default_permissions = ()
 
 
 class Video(models.Model):

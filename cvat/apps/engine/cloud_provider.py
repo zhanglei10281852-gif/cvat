@@ -291,6 +291,29 @@ class CloudStorageClient(ABC):
         self._in_parallel(upload_one, files)
 
     @abstractmethod
+    def get_file_size(self, key: str, /) -> int | None:
+        """
+        Returns the size of the file, in bytes, or None if the file does not exist.
+        Other errors (access denied, transport-level failures, etc.) are raised.
+        """
+        pass
+
+    def bulk_get_file_sizes(self, keys: Sequence[str]) -> dict[str, int | None]:
+        """
+        Returns a mapping from file keys to their sizes (in bytes).
+        A missing file maps to None.
+        """
+
+        sizes: dict[str, int | None] = {}
+
+        def get_size(key: str) -> None:
+            sizes[key] = self.get_file_size(key)
+
+        self._in_parallel(get_size, list(keys))
+
+        return sizes
+
+    @abstractmethod
     def upload_fileobj(self, file_obj: BinaryIO, key: str, /) -> None:
         pass
 
@@ -741,6 +764,14 @@ class S3CloudStorageClient(CloudStorageClient):
     def get_file_last_modified(self, key: str, /):
         return self._head_file(key).get("LastModified")
 
+    def get_file_size(self, key: str, /) -> int | None:
+        try:
+            return self._head_file(key)["ContentLength"]
+        except ClientError as ex:
+            if ex.response["Error"]["Code"] == "404":
+                return None
+            raise
+
     @validate_bucket_status
     def upload_fileobj(self, file_obj: BinaryIO, key: str, /):
         self._bucket.upload_fileobj(
@@ -915,6 +946,14 @@ class AzureBlobCloudStorageClient(CloudStorageClient):
     def get_file_last_modified(self, key: str, /):
         return self._head_file(key).last_modified
 
+    def get_file_size(self, key: str, /) -> int | None:
+        try:
+            return self._head_file(key).size
+        except HttpResponseError as ex:
+            if ex.status_code == 404:
+                return None
+            raise
+
     def get_status(self):
         try:
             self._head()
@@ -1068,6 +1107,14 @@ class GcsCloudStorageClient(CloudStorageClient):
     def get_file_status(self, key: str, /):
         self._head_file(key)
 
+    def get_file_size(self, key: str, /) -> int | None:
+        try:
+            blob = self.bucket.blob(key)
+            blob.reload()
+            return blob.size
+        except GoogleCloudNotFound:
+            return None
+
     def _list_raw_content_on_one_page(
         self,
         prefix: str = "",
@@ -1166,6 +1213,9 @@ class SubdirectoryCloudStorageClient(CloudStorageClient):
 
     def get_file_last_modified(self, key: str, /) -> datetime:
         return self.underlying.get_file_last_modified(self._map_key(key))
+
+    def get_file_size(self, key: str, /) -> int | None:
+        return self.underlying.get_file_size(self._map_key(key))
 
     def _download_fileobj_to_stream(self, key: str, stream: BinaryIO, /) -> None:
         return self.underlying._download_fileobj_to_stream(self._map_key(key), stream)

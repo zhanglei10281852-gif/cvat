@@ -5,7 +5,7 @@
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from cvat.apps.engine.models import CloudStorage, Task
+from cvat.apps.engine.models import BackingCSMigration, CloudStorage, Task
 
 from ..utils import move_multiple_tasks, parse_task_ids
 
@@ -44,6 +44,22 @@ class Command(BaseCommand):
     def _handle_one_task(self, task: Task, backing_cs: CloudStorage) -> bool:
         data = task.require_data()
 
+        migration = getattr(data, "backing_cs_migration", None)
+        if migration is not None:
+            if (
+                migration.direction == BackingCSMigration.Direction.TO_BACKING_CS
+                and migration.target_cs_id == backing_cs.id
+            ):
+                # A duplicate command: resume/converge the in-progress migration.
+                data.move_to_backing_cs(backing_cs)
+                return True
+
+            raise CommandError(
+                f"Task #{task.id} has a backing cloud storage migration in progress"
+                f" in the opposite direction or towards another cloud storage"
+                f" (#{migration.target_cs_id}); finish or resume that migration first"
+            )
+
         if data.local_storage_backing_cs_id == backing_cs.id:
             self.stdout.write(
                 self.style.WARNING(
@@ -65,3 +81,4 @@ class Command(BaseCommand):
 
         data.move_to_backing_cs(backing_cs)
         return True
+

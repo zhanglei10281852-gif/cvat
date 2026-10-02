@@ -496,6 +496,7 @@ class ZipReader(ImageListReader):
         (zip_path,) = source_paths
         self._zip_source = zipfile.ZipFile(zip_path, mode="r")
         self.extract_dir = extract_dir
+        self._zip_needs_removal = False
         file_list = [
             f for f in self._zip_source.namelist() if files_to_ignore(f) and get_mime(f) == "image"
         ]
@@ -509,7 +510,16 @@ class ZipReader(ImageListReader):
         )
 
     def __del__(self):
+        filename = self._zip_source.filename
         self._zip_source.close()
+
+        if self._zip_needs_removal:
+            # Removing only after the archive handle is closed allows the removal to work
+            # on platforms (e.g. Windows) that do not allow deleting open files.
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
 
     def get_image_size(self, i) -> tuple[int, int]:
         if self._dimension == DimensionType.DIM_3D:
@@ -583,7 +593,8 @@ class ZipReader(ImageListReader):
     def extract(self):
         self._zip_source.extractall(self._get_extract_prefix())
         if not self.extract_dir:
-            os.remove(self._zip_source.filename)
+            # The archive is removed in __del__, after the handle is closed.
+            self._zip_needs_removal = True
 
 
 class VideoReader(IMediaReader):

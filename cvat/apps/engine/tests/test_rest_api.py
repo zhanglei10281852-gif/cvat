@@ -60,6 +60,7 @@ from cvat.apps.engine.models import (
     AnnotationGuide,
     AttributeSpec,
     AttributeType,
+    BackingCSMigration,
     CloudStorage,
     Data,
     DimensionType,
@@ -1899,6 +1900,9 @@ class _CloudStorageTestBase(ApiTestBase):
             def get_file_status(self, key: str, /):
                 return Status.AVAILABLE if key in self._files else Status.NOT_FOUND
 
+            def get_file_size(self, key: str, /) -> int | None:
+                return len(self._files[key]) if key in self._files else None
+
             def _download_range_of_bytes(self, key: str, /, *, stop_byte: int, start_byte: int):
                 return self._files[key][start_byte : stop_byte + 1]
 
@@ -1914,8 +1918,9 @@ class _CloudStorageTestBase(ApiTestBase):
                 return stream, len(self._files[key])
 
             def bulk_delete(self, files: Sequence[str]) -> None:
+                # Removing a missing object is not an error, matching the real S3 semantics.
                 for key in files:
-                    del self._files[key]
+                    self._files.pop(key, None)
 
             def _list_raw_content_on_one_page(
                 self,
@@ -8437,7 +8442,8 @@ class TaskBackingCloudStorageTestCase(_CloudStorageTestBase, ExportApiTestBase):
         task_id = task["id"]
 
         data = Data.objects.get(task__id=task_id)
-        data.move_to_backing_cs(CloudStorage.objects.get(id=self.cloud_storage_id))
+        with self.captureOnCommitCallbacks(execute=True):
+            data.move_to_backing_cs(CloudStorage.objects.get(id=self.cloud_storage_id))
 
         call_command("movetaskfrombackingcs", str(task_id))
 
@@ -8455,7 +8461,8 @@ class TaskBackingCloudStorageTestCase(_CloudStorageTestBase, ExportApiTestBase):
         task_id = task["id"]
 
         data = Data.objects.get(task__id=task_id)
-        data.move_to_backing_cs(CloudStorage.objects.get(id=self.cloud_storage_id))
+        with self.captureOnCommitCallbacks(execute=True):
+            data.move_to_backing_cs(CloudStorage.objects.get(id=self.cloud_storage_id))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             task_ids_path = Path(tmp_dir, "task_ids.txt")
@@ -8466,6 +8473,222 @@ class TaskBackingCloudStorageTestCase(_CloudStorageTestBase, ExportApiTestBase):
 
         data.refresh_from_db()
         assert data.local_storage_backing_cs_id is None
+
+    def test_move_to_backing_cs_resumes_partial_upload(self):
+        task = self._create_local_task()
+        task_id = task["id"]
+
+        data = Data.objects.get(task__id=task_id)
+        upload_dir = data.get_upload_dirname()
+        media = {p: (upload_dir / p).read_bytes() for p in self._IMAGE_PATHS}
+
+        def cloud_key(rel_path: str) -> str:
+            return PurePath(f"data/{data.id}/raw", rel_path).as_posix()
+
+        backing_cs = CloudStorage.objects.get(id=self.cloud_storage_id)
+
+        # Simulate a process that exited during the parallel upload:
+        # one file fully copied, one partially copied, one not started.
+        data._claim_backing_cs_migration(
+            direction=BackingCSMigration.Direction.TO_BACKING_CS, target_cs=backing_cs
+        )
+        p1, p2, p3 = self._IMAGE_PATHS
+        self.mock_aws.create_file(cloud_key(p1), media[p1])
+        self.mock_aws.create_file(cloud_key(p2), b"partial")
+
+        # Re-running the command resumes the same migration instead of treating
+        # the partial state as completed.
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("movetasktobackingcs", str(task_id), str(self.cloud_storage_id))
+
+        data.refresh_from_db()
+        self.assertEqual(data.local_storage_backing_cs_id, self.cloud_storage_id)
+
+        for rel_path in self._IMAGE_PATHS:
+            self.assertFalse((upload_dir / rel_path).exists())
+            self.assertEqual(self.mock_aws.retrieve_file(cloud_key(rel_path)), media[rel_path])
+
+        # The manifest stays local; no migration record remains.
+        self.assertTrue((upload_dir / Data.MANIFEST_FILENAME).exists())
+        self.assertFalse(BackingCSMigration.objects.filter(data_id=data.id).exists())
+
+        # Media remains readable through the published backing CS location.
+        client = data.get_cloud_storage_client()
+        self.assertEqual(client.get_openable(p2).open("rb").read(), media[p2])
+
+    def test_move_to_backing_cs_resumes_interrupted_cleanup(self):
+        task = self._create_local_task()
+        task_id = task["id"]
+
+        data = Data.objects.get(task__id=task_id)
+        upload_dir = data.get_upload_dirname()
+        backing_cs = CloudStorage.objects.get(id=self.cloud_storage_id)
+
+        # Complete the copy and the switch, but do not run the source cleanup.
+        with self.captureOnCommitCallbacks(execute=False):
+            data.move_to_backing_cs(backing_cs)
+
+        data.refresh_from_db()
+        self.assertEqual(data.local_storage_backing_cs_id, self.cloud_storage_id)
+        self.assertTrue((upload_dir / self._IMAGE_PATHS[0]).exists())
+        self.assertEqual(
+            BackingCSMigration.objects.get(data_id=data.id).stage,
+            BackingCSMigration.Stage.CLEAN,
+        )
+
+        # Re-running safely performs the pending cleanup.
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("movetasktobackingcs", str(task_id), str(self.cloud_storage_id))
+
+        for rel_path in self._IMAGE_PATHS:
+            self.assertFalse((upload_dir / rel_path).exists())
+        self.assertTrue((upload_dir / Data.MANIFEST_FILENAME).exists())
+        self.assertFalse(BackingCSMigration.objects.filter(data_id=data.id).exists())
+
+    def test_move_from_backing_cs_fails_while_move_to_in_progress(self):
+        task = self._create_local_task()
+        task_id = task["id"]
+
+        data = Data.objects.get(task__id=task_id)
+        backing_cs = CloudStorage.objects.get(id=self.cloud_storage_id)
+
+        # An interrupted move-to leaves a COPY-stage migration.
+        data._claim_backing_cs_migration(
+            direction=BackingCSMigration.Direction.TO_BACKING_CS, target_cs=backing_cs
+        )
+
+        with self.assertRaises(CommandError):
+            call_command("movetaskfrombackingcs", str(task_id))
+
+        # The move-to state is untouched, and readers stay on the old location.
+        data = Data.objects.get(task__id=task_id)
+        self.assertIsNone(data.local_storage_backing_cs_id)
+        migration = BackingCSMigration.objects.get(data_id=data.id)
+        self.assertEqual(
+            migration.direction, BackingCSMigration.Direction.TO_BACKING_CS
+        )
+
+        # Completing the move-to lets the opposite command run afterwards.
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("movetasktobackingcs", str(task_id), str(self.cloud_storage_id))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("movetaskfrombackingcs", str(task_id))
+
+        data.refresh_from_db()
+        self.assertIsNone(data.local_storage_backing_cs_id)
+
+    def test_duplicate_move_commands_converge_to_single_result(self):
+        task = self._create_local_task()
+        task_id = task["id"]
+
+        data = Data.objects.get(task__id=task_id)
+        upload_dir = data.get_upload_dirname()
+        backing_cs = CloudStorage.objects.get(id=self.cloud_storage_id)
+
+        # Simulate the first command mid-flight: migration claimed, one file uploaded.
+        data._claim_backing_cs_migration(
+            direction=BackingCSMigration.Direction.TO_BACKING_CS, target_cs=backing_cs
+        )
+        p1 = self._IMAGE_PATHS[0]
+        self.mock_aws.create_file(
+            PurePath(f"data/{data.id}/raw", p1).as_posix(),
+            (upload_dir / p1).read_bytes(),
+        )
+
+        # A concurrent duplicate command resumes the very same migration.
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("movetasktobackingcs", str(task_id), str(self.cloud_storage_id))
+
+        data.refresh_from_db()
+        self.assertEqual(data.local_storage_backing_cs_id, self.cloud_storage_id)
+        self.assertFalse(BackingCSMigration.objects.filter(data_id=data.id).exists())
+
+        # Another run is a no-op warning, not an error.
+        call_command("movetasktobackingcs", str(task_id), str(self.cloud_storage_id))
+
+    def test_move_from_backing_cs_resumes_partial_download(self):
+        task = self._create_local_task()
+        task_id = task["id"]
+
+        data = Data.objects.get(task__id=task_id)
+        upload_dir = data.get_upload_dirname()
+        media = {p: (upload_dir / p).read_bytes() for p in self._IMAGE_PATHS}
+        backing_cs = CloudStorage.objects.get(id=self.cloud_storage_id)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            data.move_to_backing_cs(backing_cs)
+
+        # Simulate a process killed mid-download: a truncated file at the final
+        # path, migration in the COPY stage.
+        data.refresh_from_db()
+        data._claim_backing_cs_migration(
+            direction=BackingCSMigration.Direction.FROM_BACKING_CS, target_cs=backing_cs
+        )
+        p1 = self._IMAGE_PATHS[0]
+        (upload_dir / p1).parent.mkdir(parents=True, exist_ok=True)
+        (upload_dir / p1).write_bytes(b"partial")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("movetaskfrombackingcs", str(task_id))
+
+        data.refresh_from_db()
+        self.assertIsNone(data.local_storage_backing_cs_id)
+        for rel_path, expected_bytes in media.items():
+            self.assertEqual((upload_dir / rel_path).read_bytes(), expected_bytes)
+            self.assertFalse(
+                self.mock_aws.file_exists(
+                    PurePath(f"data/{data.id}/raw", rel_path).as_posix()
+                )
+            )
+        self.assertFalse(BackingCSMigration.objects.filter(data_id=data.id).exists())
+
+    def test_batch_move_continues_after_one_task_failure(self):
+        task1 = self._create_local_task()
+        task2 = self._create_local_task()
+
+        original_upload_file = self.mock_aws.upload_file
+
+        def failing_upload_file(self, file_path, key=None):
+            if key.startswith(f"data/{task1['id']}/"):
+                raise RuntimeError("simulated upload failure")
+            original_upload_file(self, file_path, key)
+
+        with (
+            mock.patch.object(self.mock_aws, "upload_file", failing_upload_file),
+            tempfile.TemporaryDirectory() as tmp_dir,
+        ):
+            task_ids_path = Path(tmp_dir, "task_ids.txt")
+            task_ids_path.write_text(f"{task1['id']}\n{task2['id']}\n")
+
+            with self.captureOnCommitCallbacks(execute=True):
+                with self.assertRaises(CommandError):
+                    call_command(
+                        "movetasktobackingcs",
+                        f"@{task_ids_path}",
+                        str(self.cloud_storage_id),
+                    )
+
+        # The failure is isolated: task 1 stays local with a resumable migration,
+        # task 2 is moved.
+        data1 = Data.objects.get(task__id=task1["id"])
+        data2 = Data.objects.get(task__id=task2["id"])
+        self.assertIsNone(data1.local_storage_backing_cs_id)
+        self.assertEqual(data2.local_storage_backing_cs_id, self.cloud_storage_id)
+        self.assertTrue(
+            BackingCSMigration.objects.filter(
+                data_id=data1.id, stage=BackingCSMigration.Stage.COPY
+            ).exists()
+        )
+        self.assertFalse(BackingCSMigration.objects.filter(data_id=data2.id).exists())
+
+        # Re-running task 1 without the injected failure completes its migration.
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command(
+                "movetasktobackingcs", str(task1["id"]), str(self.cloud_storage_id)
+            )
+        data1.refresh_from_db()
+        self.assertEqual(data1.local_storage_backing_cs_id, self.cloud_storage_id)
 
 
 class TaskJobLimitAPITestCase(ApiTestBase):

@@ -2,9 +2,9 @@
 #
 # SPDX-License-Identifier: MIT
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
-from cvat.apps.engine.models import Task
+from cvat.apps.engine.models import BackingCSMigration, Task
 
 from ..utils import move_multiple_tasks, parse_task_ids
 
@@ -26,6 +26,19 @@ class Command(BaseCommand):
 
     def _handle_one_task(self, task: Task) -> bool:
         data = task.require_data()
+
+        migration = getattr(data, "backing_cs_migration", None)
+        if migration is not None:
+            if migration.direction == BackingCSMigration.Direction.FROM_BACKING_CS:
+                # A duplicate command: resume/converge the in-progress migration.
+                data.move_from_backing_cs()
+                return True
+
+            raise CommandError(
+                f"Task #{task.id} has a migration to backing cloud storage"
+                f" #{migration.target_cs_id} in progress; finish or resume that"
+                " migration before moving the task back"
+            )
 
         if not data.local_storage_backing_cs_id:
             self.stdout.write(
