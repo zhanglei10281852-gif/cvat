@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 远端 manifest 先在隔离位置完整下载并校验，再以一个代际原子发布，下载或解析失败不会留下可见半文件。
+  - id: 2
+    type: f2p
+    text: content-v2 返回的分页令牌绑定并校验 manifest 代际，后续页面不会混入另一次刷新产生的文件集合。
+  - id: 3
+    type: f2p
+    text: 预览缓存按同一 manifest 代际生成和失效，清单更新后不会继续展示旧文件或错误的缩略内容。
+  - id: 4
+    type: f2p
+    text: 建任务选择的文件、顺序和 task-local manifest 与浏览和预览所确认的代际一致。
+  - id: 5
+    type: f2p
+    text: 清单更新或删除会一致退役旧本地版本及其预览缓存，后续请求不能复活已删除的清单。
+  - id: 6
+    type: f2p
+    text: 远端临时不可用或两个刷新并发时只保留最后有效或明确失败的完整代际，后续重试收敛且不产生 token、preview 或 task 混用。
+  - id: 7
+    type: p2p
+    text: 未发生远端更新时保留现有文件排序、权限、分页、预览和建任务成功行为，并分别验证正常路径与恢复路径。

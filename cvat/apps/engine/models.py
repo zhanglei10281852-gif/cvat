@@ -348,6 +348,9 @@ class CloudStorage(TimestampedModel):
     def has_at_least_one_manifest(self) -> bool:
         return self.manifests.exists()
 
+    def get_manifest(self, filename: str) -> Manifest | None:
+        return self.manifests.filter(filename=filename).first()
+
     def get_client(self, *, is_trusted: bool = False) -> CloudStorageClient:
         from .cloud_provider import Credentials, get_cloud_storage_client
 
@@ -1790,6 +1793,15 @@ class Manifest(models.Model):
         related_name="manifests",
         related_query_name="manifest",
     )
+    # Monotonic identifier of the complete, locally published generation of this manifest.
+    # 0 means that no generation has been published yet.
+    generation = models.PositiveBigIntegerField(default=0)
+    # Last modification time of the remote object that the published generation was built from.
+    # Used to detect whether the remote manifest has been replaced.
+    remote_last_modified = models.DateTimeField(null=True, blank=True)
+    # Path of the immutable local snapshot of the published generation,
+    # relative to the cloud storage directory (POSIX form).
+    local_snapshot = models.CharField(max_length=1024, null=True, blank=True)
 
     def __str__(self):
         return "{}".format(self.filename)

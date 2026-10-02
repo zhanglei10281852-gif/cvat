@@ -28,6 +28,7 @@ import django_rq
 from allauth.account.models import EmailAddress
 from django.conf import settings
 from django.contrib.auth.models import Group
+from django.core.cache import caches
 from django.core.files.uploadedfile import UploadedFile
 from django.db import transaction
 from django.db.models import Count, Prefetch, QuerySet, prefetch_related_objects
@@ -39,7 +40,7 @@ from PIL import Image
 from rest_framework import exceptions, serializers
 from rest_framework.reverse import reverse
 
-from cvat.apps.engine import field_validation, models
+from cvat.apps.engine import cloud_manifest, field_validation, models
 from cvat.apps.engine.cloud_provider import (
     Credentials,
     Status,
@@ -4656,7 +4657,21 @@ class CloudStorageWriteSerializer(serializers.ModelSerializer):
             previous_manifest_names = set(i.filename for i in instance.manifests.all())
             delta_to_delete = tuple(previous_manifest_names - new_manifest_names)
             delta_to_create = tuple(new_manifest_names - previous_manifest_names)
+
+            manifests_changed = bool(delta_to_delete or delta_to_create)
+            # Preview cache items derived from the old set of manifest
+            # generations must not survive the manifest list update.
+            preview_cache_keys_to_drop: set[str] = set()
+            if manifests_changed:
+                preview_cache_keys_to_drop.add(
+                    cloud_manifest.make_cloud_preview_cache_key(instance)
+                )
+
+            manifests_to_delete = []
             if delta_to_delete:
+                manifests_to_delete = list(
+                    instance.manifests.filter(filename__in=delta_to_delete)
+                )
                 instance.manifests.filter(filename__in=delta_to_delete).delete()
             if delta_to_create:
                 # check manifest files existing
@@ -4673,6 +4688,20 @@ class CloudStorageWriteSerializer(serializers.ModelSerializer):
 
                 instance.credentials = real_path_to_key_file
             instance.save()
+
+            for db_manifest in manifests_to_delete:
+                # Remove all local generations of deregistered manifests so that
+                # their old copies cannot be used after the list update.
+                cloud_manifest.discard_manifest_snapshots(
+                    instance, db_manifest.id, db_manifest.filename
+                )
+
+            if manifests_changed:
+                preview_cache_keys_to_drop.add(
+                    cloud_manifest.make_cloud_preview_cache_key(instance, signature=())
+                )
+                caches["media"].delete_many(tuple(preview_cache_keys_to_drop))
+
             return instance
         elif storage_status == Status.FORBIDDEN:
             field = "credentials"

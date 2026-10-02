@@ -906,6 +906,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/CloudStorageContent'
           description: A manifest content
+        '409':
+          description: The manifest was updated while paging through its contents
+        '429':
+          description: The manifest is being refreshed by another request
   /api/cloudstorages/{id}/preview:
     get:
       operationId: cloudstorages_retrieve_preview

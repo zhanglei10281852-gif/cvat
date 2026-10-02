@@ -11,7 +11,7 @@ import shutil
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, NamedTuple, TypeAlias
 from urllib import parse as urlparse
@@ -58,13 +58,10 @@ from utils.dataset_manifest import (
     VideoManifestManager,
     is_manifest,
 )
-from utils.dataset_manifest.core import (
-    VideoManifestValidator,
-    is_dataset_manifest,
-    is_video_manifest,
-)
+from utils.dataset_manifest.core import VideoManifestValidator, is_dataset_manifest
 from utils.dataset_manifest.utils import find_related_images
 
+from . import cloud_manifest
 from .cloud_provider import HeaderFirstMediaDownloader
 
 slogger = ServerLogManager(__name__)
@@ -436,28 +433,31 @@ def _validate_manifest(
     is_in_cloud: bool,
     db_cloud_storage: models.CloudStorage | None,
     is_backup_restore: bool,
-) -> str | None:
+) -> tuple[str | None, cloud_manifest.PublishedManifest | None]:
     if not manifests:
-        return None
+        return None, None
 
     if len(manifests) != 1:
         raise ValidationError("Only one manifest file can be attached to data")
     manifest_file = manifests[0]
-    full_manifest_path = join_untrusted_path(root_dir, manifest_file)
 
+    published_manifest = None
     if is_in_cloud and not is_backup_restore:
-        storage_client = db_cloud_storage.get_client()
-        # check that cloud storage manifest file exists and is up to date
-        if not full_manifest_path.exists() or (
-            datetime.fromtimestamp(full_manifest_path.stat().st_mtime, tz=timezone.utc)
-            < storage_client.get_file_last_modified(manifest_file)
-        ):
-            storage_client.download_file(manifest_file, full_manifest_path)
+        # Task file selection must be based on a single, complete generation of
+        # the manifest. A concurrent remote replacement cannot switch the local
+        # copy while the task is being created, and a failed refresh never
+        # replaces the previously published generation.
+        published_manifest = cloud_manifest.publish_manifest_by_filename(
+            db_cloud_storage, manifest_file
+        )
+        full_manifest_path = published_manifest.snapshot_path
+    else:
+        full_manifest_path = join_untrusted_path(root_dir, manifest_file)
 
     if not is_manifest(full_manifest_path):
         raise ValidationError("Invalid manifest was uploaded")
 
-    return manifest_file
+    return manifest_file, published_manifest
 
 
 def _validate_scheme(url):
@@ -1632,7 +1632,7 @@ def initialize_task(
     else:
         assert False, f"Unknown file storage {db_data.storage}"
 
-    manifest_file = _validate_manifest(
+    manifest_file, published_cloud_manifest = _validate_manifest(
         manifest_files,
         manifest_root,
         is_in_cloud=is_data_in_cloud,
@@ -1644,18 +1644,15 @@ def initialize_task(
         cloud_storage_manifest: ImageManifestManager | VideoManifestManager | None = None
         cloud_storage_manifest_prefix: str | None = None
         if manifest_file:
-            cloud_storage_manifest_path = (
-                db_data.cloud_storage.get_storage_dirname() / manifest_file
-            )
-            if is_video_manifest(cloud_storage_manifest_path):
+            assert published_cloud_manifest is not None
+            cloud_storage_manifest_path = published_cloud_manifest.snapshot_path
+            if published_cloud_manifest.kind == "video":
                 cloud_storage_manifest = VideoManifestManager(cloud_storage_manifest_path)
-            elif is_dataset_manifest(cloud_storage_manifest_path):
+            else:
                 cloud_storage_manifest = ImageManifestManager(
                     cloud_storage_manifest_path,
-                    db_data.cloud_storage.get_storage_dirname(),
+                    cloud_storage_manifest_path.parent,
                 )
-            else:
-                raise ValidationError(f"Can't recognize type of the manifest at '{manifest_file}'")
             cloud_storage_manifest.set_index()
             cloud_storage_manifest_prefix = os.path.dirname(manifest_file)
 

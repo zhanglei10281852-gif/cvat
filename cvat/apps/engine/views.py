@@ -14,7 +14,7 @@ import zlib
 from abc import ABCMeta, abstractmethod
 from contextlib import suppress
 from copy import copy
-from datetime import datetime, timezone
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -54,6 +54,7 @@ from cvat.apps.engine.cache import (
     LockError,
     MediaCache,
 )
+from cvat.apps.engine import cloud_manifest
 from cvat.apps.engine.cloud_provider import Status as CloudStorageStatus
 from cvat.apps.engine.exceptions import CloudStorageMissingError
 from cvat.apps.engine.media_extractors import get_mime, get_video_chapters
@@ -157,7 +158,7 @@ from cvat.apps.iam.filters import ORGANIZATION_OPEN_API_PARAMETERS
 from cvat.apps.iam.models import User
 from cvat.apps.redis_handler.serializers import RqIdSerializer
 from cvat.utils import django_database as db_utils
-from cvat.utils.paths import join_untrusted_path, problem_with_untrusted_path
+from cvat.utils.paths import problem_with_untrusted_path
 from utils.dataset_manifest import ImageManifestManager
 
 from . import models
@@ -3494,6 +3495,12 @@ class CloudStorageViewSet(
             "200": OpenApiResponse(
                 response=CloudStorageContentSerializer, description="A manifest content"
             ),
+            "409": OpenApiResponse(
+                description="The manifest was updated while paging through its contents"
+            ),
+            "429": OpenApiResponse(
+                description="The manifest is being refreshed by another request"
+            ),
         },
     )
     @action(detail=True, methods=["GET"], url_path="content-v2")
@@ -3519,34 +3526,58 @@ class CloudStorageViewSet(
                 if problem := problem_with_untrusted_path(manifest_path):
                     return HttpResponseBadRequest(f"manifest_path: {problem}")
 
-                manifest_prefix = os.path.dirname(manifest_path)
-
-                full_manifest_path = join_untrusted_path(
-                    db_storage.get_storage_dirname(), manifest_path
-                )
-
-                if not full_manifest_path.exists() or datetime.fromtimestamp(
-                    full_manifest_path.stat().st_mtime, tz=timezone.utc
-                ) < storage_client.get_file_last_modified(manifest_path):
-                    storage_client.download_file(manifest_path, full_manifest_path)
-                manifest = ImageManifestManager(
-                    full_manifest_path, db_storage.get_storage_dirname()
-                )
-                # need to update index
-                manifest.set_index()
                 try:
-                    start_index = int(next_token or "0")
-                except ValueError:
+                    (
+                        token_manifest_id,
+                        token_generation,
+                        start_index,
+                    ) = cloud_manifest.parse_manifest_page_token(next_token)
+                except ValidationError:
                     return HttpResponseBadRequest(
                         "Wrong value for the next_token parameter was found."
                     )
+
+                # Bind the whole paged view to a single, complete generation of
+                # the manifest. The refresh is a no-op when the remote manifest
+                # has not been modified, so sorting, permissions, pagination and
+                # task creation behavior is preserved in that case.
+                published = cloud_manifest.publish_manifest_by_filename(
+                    db_storage, manifest_path, storage_client=storage_client
+                )
+
+                if token_manifest_id is not None and (
+                    token_manifest_id != published.manifest_id
+                    or token_generation != published.generation
+                ):
+                    # The remote manifest was replaced after the previous page
+                    # was served. Do not mix generations in one listing.
+                    return Response(
+                        "The cloud storage manifest has been updated. "
+                        "Please request the first page again.",
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if published.kind != "images":
+                    raise ValidationError("Browsing video manifests is not supported")
+
+                manifest = ImageManifestManager(
+                    published.snapshot_path, published.snapshot_path.parent
+                )
+                # need to update index
+                manifest.set_index()
                 content = manifest.emulate_hierarchical_structure(
                     page_size,
-                    manifest_prefix=manifest_prefix,
+                    manifest_prefix=published.manifest_prefix,
                     prefix=prefix,
                     default_prefix=storage_client.prefix,
                     start_index=start_index,
                 )
+                if content["next"] is not None:
+                    content["next"] = cloud_manifest.encode_manifest_page_token(
+                        published.manifest_id,
+                        published.generation,
+                        content["next"],
+                    )
             else:
                 content = storage_client.list_files_on_one_page(
                     prefix, next_token=next_token, page_size=page_size, _use_sort=True
@@ -3575,6 +3606,11 @@ class CloudStorageViewSet(
             )
             slogger.cloud_storage[pk].info(msg)
             return Response(data=msg, status=ex.status_code)
+        except (TimeoutError, LockError):
+            return Response(
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": _RETRY_AFTER_TIMEOUT},
+            )
         except Exception as ex:
             slogger.glob.error(str(ex))
             return Response(

@@ -202,10 +202,21 @@ function RemoteBrowser(props: Props): JSX.Element {
                 }
             } catch (error: any) {
                 if (isRelevant()) {
-                    notification.error({
-                        message: 'Storage content fetching failed',
-                        description: error.toString(),
-                    });
+                    // The server binds paging tokens to a manifest generation.
+                    // If the remote manifest was replaced, restart from the
+                    // first page instead of mixing contents of two generations.
+                    const generationChanged = error?.code === 409 && dataSource.nextToken;
+                    if (generationChanged) {
+                        dataSource.nextToken = null;
+                        dataSource.children = [];
+                        dataSource.initialized = false;
+                        await updateContent();
+                    } else {
+                        notification.error({
+                            message: 'Storage content fetching failed',
+                            description: error.toString(),
+                        });
+                    }
                 }
             } finally {
                 if (isRelevant()) {

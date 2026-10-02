@@ -15,7 +15,7 @@ import zipfile
 import zlib
 from collections.abc import Callable, Collection, Generator, Iterator, Sequence
 from contextlib import ExitStack, closing
-from datetime import datetime, timezone
+from datetime import datetime
 from itertools import groupby, pairwise
 from pathlib import Path, PurePath
 from typing import Any, TypeAlias, overload
@@ -31,10 +31,10 @@ from django.core.cache import caches
 from django.db import models as django_models
 from django.utils import timezone as django_tz
 from redis.exceptions import LockError
-from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.exceptions import NotFound
 from rq.job import JobStatus as RQJobStatus
 
-from cvat.apps.engine import models
+from cvat.apps.engine import cloud_manifest, models
 from cvat.apps.engine.cache_signals import cache_item_created_signal, cache_item_read_signal
 from cvat.apps.engine.log import ServerLogManager
 from cvat.apps.engine.media_extractors import (
@@ -594,16 +594,40 @@ class MediaCache:
 
     def get_cloud_preview(self, db_storage: models.CloudStorage) -> DataWithMime | None:
         return self._to_data_with_mime(
-            self._get_cache_item(self._make_preview_key(db_storage)), allow_none=True
+            self._get_cache_item(
+                cloud_manifest.make_cloud_preview_cache_key(db_storage, signature=())
+            ),
+            allow_none=True,
         )
 
     def get_or_set_cloud_preview(self, db_storage: models.CloudStorage) -> DataWithMime:
+        storage_client = db_storage.get_client()
+
+        # Publish complete generations first, so that both the preview bytes and
+        # the cache key are bound to the same manifest generation. Concurrent
+        # refreshes converge inside publish_cloud_manifest().
+        pinned_manifests: list[list[str]] = []
+        for db_manifest in db_storage.manifests.order_by("id"):
+            published = cloud_manifest.publish_cloud_manifest(
+                db_storage, db_manifest, storage_client=storage_client
+            )
+            pinned_manifests.append(
+                [
+                    str(published.snapshot_path),
+                    published.manifest_prefix,
+                    published.kind,
+                ]
+            )
+
+        signature = cloud_manifest.get_manifests_generation_signature(db_storage)
+        preview_key = cloud_manifest.make_cloud_preview_cache_key(db_storage, signature)
+
         return self._to_data_with_mime(
             self._get_or_set_cache_item(
-                self._make_preview_key(db_storage),
+                preview_key,
                 Callback(
                     callable=self._prepare_cloud_preview,
-                    args=[db_storage],
+                    args=[db_storage, pinned_manifests],
                 ),
                 cache_item_ttl=self._PREVIEW_TTL,
             )
@@ -1075,28 +1099,34 @@ class MediaCache:
 
         return prepare_preview_image(preview)
 
-    def _prepare_cloud_preview(self, db_storage: models.CloudStorage | int) -> DataWithMime:
+    def _prepare_cloud_preview(
+        self,
+        db_storage: models.CloudStorage | int,
+        pinned_manifests: Sequence[Sequence[str]],
+    ) -> DataWithMime:
         if isinstance(db_storage, int):
             db_storage = models.CloudStorage.objects.get(pk=db_storage)
 
         storage_client = db_storage.get_client()
-        if not db_storage.manifests.count():
-            raise ValidationError("Cannot get the cloud storage preview. There is no manifest file")
 
+        # Only complete, published generations are used here, and the manifest
+        # snapshots are immutable, so the preview cannot be switched to another
+        # generation while it is being prepared.
         preview_path = None
-        for db_manifest in db_storage.manifests.all():
-            manifest_prefix = os.path.dirname(db_manifest.filename)
+        for snapshot_path_str, manifest_prefix, manifest_kind in pinned_manifests:
+            if manifest_kind != "images":
+                continue
 
-            full_manifest_path = join_untrusted_path(
-                db_storage.get_storage_dirname(), db_manifest.filename
-            )
+            snapshot_path = Path(snapshot_path_str)
+            if not snapshot_path.is_file():
+                # The pinned generation was garbage collected. A retry publishes
+                # and pins the current generation again, so the failure converges.
+                raise NotFound(
+                    "The pinned cloud storage manifest generation is no longer available, "
+                    "please retry"
+                )
 
-            if not full_manifest_path.exists() or datetime.fromtimestamp(
-                full_manifest_path.stat().st_mtime, tz=timezone.utc
-            ) < storage_client.get_file_last_modified(db_manifest.filename):
-                storage_client.download_file(db_manifest.filename, full_manifest_path)
-
-            manifest = ImageManifestManager(full_manifest_path, db_storage.get_storage_dirname())
+            manifest = ImageManifestManager(snapshot_path, snapshot_path.parent)
             # need to update index
             manifest.set_index()
             if not len(manifest):
