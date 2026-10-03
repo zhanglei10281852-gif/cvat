@@ -59,6 +59,22 @@ class QualityReportQueueManager(AbstractRequestManager):
             raise serializers.ValidationError("Provided request id is invalid")
         return super().get_job_by_id(id_)
 
+    def build_request_id(self) -> str:
+        return QualityRequestId(
+            target=self.target,
+            target_id=self.db_instance.pk,
+        ).render()
+
+    def init_callback_with_params(self) -> None:
+        if self.target == RequestTarget.TASK:
+            self.callback = QualityReportManager.check_task_quality
+            self.callback_kwargs = {"task_id": self.db_instance.pk}
+        elif self.target == RequestTarget.PROJECT:
+            self.callback = QualityReportManager.check_project_quality
+            self.callback_kwargs = {"project_id": self.db_instance.pk}
+        else:
+            raise serializers.ValidationError("Unsupported quality report target")
+
     def validate_request(self):
         super().validate_request()
 

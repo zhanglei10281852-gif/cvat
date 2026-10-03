@@ -418,7 +418,8 @@ def _save_conflicts(
             db_conflict = next(db_conflicts_iter)
             for ann_id in conflict.annotation_ids:
                 AnnotationId.objects.create(
-                    obj_id=ann_id["job_id"],
+                    obj_id=ann_id["obj_id"],
+                    job_id=ann_id["job_id"],
                     type=ann_id["type"],
                     shape_type=ann_id["shape_type"],
                     conflict=db_conflict,

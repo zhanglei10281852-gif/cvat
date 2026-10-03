@@ -5,6 +5,7 @@
 import textwrap
 from datetime import datetime, timezone
 
+from django.db import models
 from django.db.models import Q
 from django.http import HttpResponse
 from drf_spectacular.types import OpenApiTypes
